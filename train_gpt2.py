@@ -218,17 +218,28 @@ torch.set_float32_matmul_precision("high")
 model = torch.compile(model)
 
 
+total_batch_size = 524288
+B = 4
+T = 1024
+assert total_batch_size % (B * T) == 0
+grad_accumulation_steps = total_batch_size // (B * T)
+
 optimizer = model.configure_optimizers(weight_decay = 0.1, learning_rate = 6e-4, device = device)
 for step in range(50):
     start_time = time.time()
     optimizer.zero_grad()
-    x, y = shakespeare_dataset.get_batch()
-    x = x.to(device)
-    y = y.to(device)
+    loss_accumulated = 0
+    for micro_step in range(grad_accumulation_steps):
+        x, y = shakespeare_dataset.get_batch()
+        x = x.to(device)
+        y = y.to(device)
+
+        with torch.autocast(device_type = device.type, dtype = torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accumulation_steps
+        loss.backward()
+        loss_accumulated += loss.detach()
     
-    with torch.autocast(device_type = device.type, dtype = torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param in optimizer.param_groups:
@@ -236,7 +247,7 @@ for step in range(50):
     optimizer.step()
     torch.cuda.synchronize()
     end_time = time.time()
-    print(f"Step {step}: loss {loss.item():.6f}, lr {lr:.6f}, time {end_time - start_time}, norm {norm: .4f}, tokens per second {shakespeare_dataset.B*shakespeare_dataset.T/(end_time - start_time):.2f}")
+    print(f"Step {step}: loss {loss_accumulated.item():.6f}, lr {lr:.6f}, time {end_time - start_time}, norm {norm: .4f}, tokens per second {shakespeare_dataset.B*shakespeare_dataset.T*grad_accumulation_steps/(end_time - start_time):.2f}")
     
 
 
