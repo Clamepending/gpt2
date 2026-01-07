@@ -5,11 +5,32 @@ from torch.nn import functional as F
 import math
 
 
-#downlaod tiny shakespeare dataset from https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-import requests
-url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-response = requests.get(url)
-text = response.text
+
+
+
+class DataloaderLite:
+    def __init__(self, B, T):
+        #downlaod tiny shakespeare dataset from https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+        import requests
+        url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+        response = requests.get(url)
+        text = response.text
+        self.text = torch.tensor(tokenizer.encode(text), dtype = torch.long)
+        self.current_pos = 0
+        self.B = B
+        self.T = T
+        
+    def get_batch(self):
+        buf = self.text[self.current_pos:self.current_pos+self.B*self.T+1]
+        x = buf[:-1].view(self.B, self.T)
+        y = buf[1:].view(self.B, self.T)
+        
+        self.current_pos += self.B*self.T
+        if self.current_pos + self.B*self.T >= len(self.text):
+            self.current_pos = 0
+        return x, y
+        
+        
 
 
 @dataclass
@@ -30,6 +51,7 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(config.n_embed, config.n_embed)
         self.n_embed = config.n_embed
         self.n_head = config.n_head
+        self.c_proj.RESIDUAL_SCALE_FLAG = True
         
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)) # for batch, num_heads, bloxksize, blocksize
         
@@ -52,13 +74,14 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: GPT2config):
         super().__init__()
-        self.l1 = nn.Linear(config.n_embed, 4 * config.n_embed)
+        self.c_fc = nn.Linear(config.n_embed, 4 * config.n_embed)
         self.gelu = nn.GELU()
-        self.l2 = nn.Linear(4 * config.n_embed, config.n_embed)
+        self.c_proj = nn.Linear(4 * config.n_embed, config.n_embed)
+        self.c_proj.RESIDUAL_SCALE_FLAG = True
     def forward(self, x):
-        x = self.l1(x)
+        x = self.c_fc(x)
         x = self.gelu(x)
-        x = self.l2(x)
+        x = self.c_proj(x)
         return x
 
 
@@ -89,6 +112,23 @@ class GPT2(nn.Module):
             
         ))
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias = False)
+        
+        
+        self.transformer.wte.weight = self.lm_head.weight
+        
+        self.apply(self.init_weights)
+        
+        
+    def init_weights(self, module):
+        std = 0.02
+        if isinstance(module, nn.Linear):
+            if hasattr(module, "RESIDUAL_SCALE_FLAG"):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean = 0.0, std = std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean = 0.0, std = std)
         
         
     def forward(self, idx, targets = None):
@@ -128,16 +168,20 @@ model = model.eval()
 
 B, T = 4, 32
 torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
 
-buf = torch.tensor(tokenizer.encode(text)[:B*T+1], dtype = torch.long)
-x = buf[:-1].view(B, T).to(device)
-y = buf[1:].view(B, T).to(device)
+shakespeare_dataset = DataloaderLite(B, T)
 
 
 optimizer = torch.optim.AdamW(model.parameters(), lr = 1e-3)
 for i in range(50):
     optimizer.zero_grad()
+    x, y = shakespeare_dataset.get_batch()
+    x = x.to(device)
+    y = y.to(device)
     logits, loss = model(x, y)
+    loss.item()
     loss.backward()
     optimizer.step()
     print(f"Step {i}: loss {loss.item()}")
