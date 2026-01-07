@@ -4,6 +4,14 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 
+
+#downlaod tiny shakespeare dataset from https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+import requests
+url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+response = requests.get(url)
+text = response.text
+
+
 @dataclass
 class GPT2config:
     vocab_size = 50257
@@ -83,7 +91,7 @@ class GPT2(nn.Module):
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias = False)
         
         
-    def forward(self, idx):
+    def forward(self, idx, targets = None):
         B, T = idx.size()
         pos = torch.arange(0, T, dtype = torch.long, device = idx.device)
         pos = self.transformer.wpe(pos) # T C
@@ -93,7 +101,10 @@ class GPT2(nn.Module):
             x = block(x) # B T C
         x = self.transformer.ln_f(x) # B T C
         x = self.lm_head(x) # B T V
-        return x
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(x.view(-1, x.size(-1)), targets.view(-1))
+        return x, loss
         
 
 # --------------------------------------------------
@@ -114,26 +125,47 @@ x = tokens.to(device)
 model = GPT2(GPT2config()).to(device)
 model = model.eval()
 
+
+B, T = 4, 32
 torch.manual_seed(42)
 
-with torch.no_grad():
-    while x.size(1) < max_length:
-        logits = model(x) # B T V
-        logits = logits[:,-1,:] # B V
+buf = torch.tensor(tokenizer.encode(text)[:B*T+1], dtype = torch.long)
+x = buf[:-1].view(B, T).to(device)
+y = buf[1:].view(B, T).to(device)
+
+
+optimizer = torch.optim.AdamW(model.parameters(), lr = 1e-3)
+for i in range(50):
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"Step {i}: loss {loss.item()}")
+    
+
+
+
+
+
+
+# with torch.no_grad():
+#     while x.size(1) < max_length:
+#         logits = model(x) # B T V
+#         logits = logits[:,-1,:] # B V
         
-        probs = F.softmax(logits, dim=-1) # B V
+#         probs = F.softmax(logits, dim=-1) # B V
         
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # B 50
+#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # B 50
         
-        ix = torch.multinomial(topk_probs, 1) # B 1
+#         ix = torch.multinomial(topk_probs, 1) # B 1
         
-        x_next = torch.gather(topk_indices, 1, ix) # B 1
+#         x_next = torch.gather(topk_indices, 1, ix) # B 1
         
-        x = torch.cat((x, x_next), dim=1) # B T+1
+#         x = torch.cat((x, x_next), dim=1) # B T+1
         
-decoded = tokenizer.decode_batch(x.tolist())
-for d in decoded:
-    print(d)
+# decoded = tokenizer.decode_batch(x.tolist())
+# for d in decoded:
+#     print(d)
         
         
         
