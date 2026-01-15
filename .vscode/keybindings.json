@@ -1,0 +1,6 @@
+[
+    {
+        "key": "cmd+j",
+        "command": "workbench.view.explorer"
+    }
+]

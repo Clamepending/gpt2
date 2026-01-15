@@ -8,25 +8,28 @@ import inspect
 
 
 
+
+
 class DataloaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, ddp_rank, ddp_world_size):
         #downlaod tiny shakespeare dataset from https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
         import requests
         url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
         response = requests.get(url)
         text = response.text
         self.text = torch.tensor(tokenizer.encode(text), dtype = torch.long)
-        self.current_pos = 0
+        self.current_pos = ddp_rank * B * T
         self.B = B
         self.T = T
+        self.ddp_world_size = ddp_world_size
         
     def get_batch(self):
         buf = self.text[self.current_pos:self.current_pos+self.B*self.T+1]
         x = buf[:-1].view(self.B, self.T)
         y = buf[1:].view(self.B, self.T)
         
-        self.current_pos += self.B*self.T
-        if self.current_pos + self.B*self.T >= len(self.text):
+        self.current_pos += self.B*self.T * self.ddp_world_size
+        if self.current_pos + self.B*self.T*self.ddp_world_size >= len(self.text):
             self.current_pos = 0
         return x, y
         
@@ -192,39 +195,71 @@ def get_lr(it):
 
 num_return_sequences = 5
 max_length = 30
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 
 import tiktoken
 tokenizer = tiktoken.get_encoding("gpt2")
 
-tokens = tokenizer.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype = torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to(device)
 
-model = GPT2(GPT2config(vocab_size = 50304)).to(device)
+
+# DDP
+from torch.distributed import init_process_group, destroy_process_group
+
+import os
+ddp = int(os.environ.get("RANK", -1)) != -1
+if ddp:
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    
+    master_process = ddp_rank == 0
+    
+    torch.cuda.set_device(f'cuda:{ddp_local_rank}')
+    device = torch.device(f'cuda:{ddp_local_rank}')
+    init_process_group(backend="nccl")
+else:
+    ddp_rank = 0
+    ddp_local_rank =0 
+    ddp_world_size = 1
+    master_process = True
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    
+
+
+
+
+
+
 
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
 
-shakespeare_dataset = DataloaderLite(4, 1024)
+shakespeare_dataset = DataloaderLite(4, 1024, ddp_rank, ddp_world_size)
 
-import time
+
 
 torch.set_float32_matmul_precision("high")
 
+model = GPT2(GPT2config(vocab_size = 50304)).to(device)
 model = torch.compile(model)
 
+from torch.nn.parallel import DistributedDataParallel as DDP
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
 total_batch_size = 524288
 B = 4
 T = 1024
-assert total_batch_size % (B * T) == 0
-grad_accumulation_steps = total_batch_size // (B * T)
+assert total_batch_size % (B * T * ddp_world_size) == 0
+grad_accumulation_steps = total_batch_size // (B * T * ddp_world_size)
+print(f"Total batch size: {total_batch_size}, Grad accumulation steps: {grad_accumulation_steps}")
 
-optimizer = model.configure_optimizers(weight_decay = 0.1, learning_rate = 6e-4, device = device)
+import time
+optimizer = raw_model.configure_optimizers(weight_decay = 0.1, learning_rate = 6e-4, device = device)
 for step in range(50):
     start_time = time.time()
     optimizer.zero_grad()
@@ -233,13 +268,21 @@ for step in range(50):
         x, y = shakespeare_dataset.get_batch()
         x = x.to(device)
         y = y.to(device)
-
-        with torch.autocast(device_type = device.type, dtype = torch.bfloat16):
-            logits, loss = model(x, y)
-        loss = loss / grad_accumulation_steps
-        loss.backward()
+        if ddp and micro_step != grad_accumulation_steps - 1: # don't sync gradients until the last micro_step
+            with model.no_sync():
+                with torch.autocast(device_type = device.type, dtype = torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / grad_accumulation_steps
+                loss.backward()
+        else:
+            with torch.autocast(device_type = device.type, dtype = torch.bfloat16):
+                logits, loss = model(x, y)
+            loss = loss / grad_accumulation_steps
+            loss.backward()
         loss_accumulated += loss.detach()
     
+    if ddp:
+        torch.distributed.all_reduce(loss_accumulated, op = torch.distributed.ReduceOp.AVG) # average the loss across all devices
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param in optimizer.param_groups:
@@ -247,34 +290,38 @@ for step in range(50):
     optimizer.step()
     torch.cuda.synchronize()
     end_time = time.time()
-    print(f"Step {step}: loss {loss_accumulated.item():.6f}, lr {lr:.6f}, time {end_time - start_time}, norm {norm: .4f}, tokens per second {shakespeare_dataset.B*shakespeare_dataset.T*grad_accumulation_steps/(end_time - start_time):.2f}")
+    if not ddp or master_process:
+        tokens_processed = shakespeare_dataset.B*shakespeare_dataset.T*grad_accumulation_steps*ddp_world_size
+        print(f"Step {step}: loss {loss_accumulated.item():.6f}, lr {lr:.6f}, time {end_time - start_time}, norm {norm: .4f}, tokens per second {tokens_processed:.2f}")
     
 
+# sample
+if not ddp or master_process:
+    tokens = tokenizer.encode("Hello, I'm a language model,")
+    tokens = torch.tensor(tokens, dtype = torch.long)
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+    x = tokens.to(device)
 
+    with torch.no_grad():
+        while x.size(1) < max_length:
+            logits, _ = raw_model(x) # B T V - use raw_model for inference to avoid DDP collectives
+            logits = logits[:,-1,:] # B V
+            
+            probs = F.softmax(logits, dim=-1) # B V
+            
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # B 50
+            
+            ix = torch.multinomial(topk_probs, 1) # B 1
+            
+            x_next = torch.gather(topk_indices, 1, ix) # B 1
+            
+            x = torch.cat((x, x_next), dim=1) # B T+1
+            
+    decoded = tokenizer.decode_batch(x.tolist())
+    for d in decoded:
+        print(d)
 
-
-
-
-# with torch.no_grad():
-#     while x.size(1) < max_length:
-#         logits = model(x) # B T V
-#         logits = logits[:,-1,:] # B V
-        
-#         probs = F.softmax(logits, dim=-1) # B V
-        
-#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # B 50
-        
-#         ix = torch.multinomial(topk_probs, 1) # B 1
-        
-#         x_next = torch.gather(topk_indices, 1, ix) # B 1
-        
-#         x = torch.cat((x, x_next), dim=1) # B T+1
-        
-# decoded = tokenizer.decode_batch(x.tolist())
-# for d in decoded:
-#     print(d)
-        
-        
-        
+if ddp:
+    destroy_process_group()
 
 
