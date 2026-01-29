@@ -263,8 +263,9 @@ tokenizer = tiktoken.get_encoding("gpt2")
 
 
 # shakespeare_dataset = DataloaderLite(4, 1024, ddp_rank, ddp_world_size)
-fineweb_dataset = FineWebDataLoader(B=4, T=1024, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size)
-
+train_dataloader = FineWebDataLoader(B=train_config.B, T=train_config.T, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size, split="training")
+if not ddp or master_process:
+    validation_dataloader = FineWebDataLoader(B=train_config.B, T=train_config.T, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size, split="validation")
 
 
 torch.set_float32_matmul_precision("high")
@@ -290,7 +291,7 @@ for step in range(train_config.max_steps):
     optimizer.zero_grad()
     loss_accumulated = 0
     for micro_step in range(train_config.grad_accumulation_steps):
-        x, y = fineweb_dataset.get_batch()
+        x, y = train_dataloader.get_batch()
         x = x.to(device)
         y = y.to(device)
         if ddp and micro_step != train_config.grad_accumulation_steps - 1: # don't sync gradients until the last micro_step
@@ -318,21 +319,29 @@ for step in range(train_config.max_steps):
     torch.cuda.synchronize()
     end_time = time.time()
     if not ddp or master_process:
-        tokens_processed += fineweb_dataset.B*fineweb_dataset.T*train_config.grad_accumulation_steps*ddp_world_size
-        print(f"Step {step}: loss {loss_accumulated.item():.6f}, lr {lr:.6f}, time {end_time - start_time}, norm {norm: .4f}, tokens per second {fineweb_dataset.B*fineweb_dataset.T*train_config.grad_accumulation_steps*ddp_world_size/(end_time - start_time):.2f}, perplexity {perplexity[step]:.2f}")
+        tokens_processed += train_config.B*train_config.T*train_config.grad_accumulation_steps*ddp_world_size
+        print(f"Step {step}: loss {loss_accumulated.item():.6f}, lr {lr:.6f}, time {end_time - start_time}, norm {norm: .4f}, tokens per second {train_config.B*train_config.T*train_config.grad_accumulation_steps*ddp_world_size/(end_time - start_time):.2f}, perplexity {perplexity[step]:.2f}")
         wandb.log({"train/loss": losses[step],
                    "train/lr": lr,
                    "train/norm": norm,
-                   "train/tokens_per_second": fineweb_dataset.B*fineweb_dataset.T*train_config.grad_accumulation_steps*ddp_world_size/(end_time - start_time),
+                   "train/tokens_per_second": train_config.B*train_config.T*train_config.grad_accumulation_steps*ddp_world_size/(end_time - start_time),
                    "train/perplexity": perplexity[step],
                    "train/tokens_processed": tokens_processed},
                     step=step)
         if step % train_config.sample_interval == 0:
-            responses = sample_from_model(model, "Hello, I'm a language model,", train_config.num_samples_per_interval, train_config.sample_max_length)
-            table_data = [(step, response) for response in responses]
-            table = wandb.Table(data=table_data, columns=["step", "sample"])
-            wandb.log({"samples": table}, step=step)
-            # sample from the model
+            with torch.inference_mode():
+                x, y = validation_dataloader.get_batch()
+                x = x.to(device)
+                y = y.to(device)
+                with torch.autocast(device_type = device.type, dtype = torch.bfloat16):
+                    logits, loss = raw_model(x, y) # deadlocks if use ddp model here because only master process validates
+                wandb.log({"validation/loss": loss.item(),
+                        "validation/perplexity": torch.exp(loss)}, step=step)
+            
+                responses = sample_from_model(model, "Hello, I'm a language model,", train_config.num_samples_per_interval, train_config.sample_max_length)
+                table_data = [(step, response) for response in responses]
+                table = wandb.Table(data=table_data, columns=["step", "sample"])
+                wandb.log({"samples": table}, step=step)
 
 if not ddp or master_process:
     wandb.finish()

@@ -6,7 +6,8 @@ import glob
 class FineWebDataLoader:
     def __init__(self, B, T, ddp_rank=0, ddp_world_size=1, 
                  dataset_path="fineweb-edu/gpt2_numpy",
-                 buffer_size=1000000):
+                 buffer_size=1000000,
+                 split="training"):
         self.B, self.T = B, T
         self.ddp_rank, self.ddp_world_size = ddp_rank, ddp_world_size
         self.buffer_size = buffer_size
@@ -23,7 +24,7 @@ class FineWebDataLoader:
         self.dataset_path = dataset_path
         
         # Find all numpy shard files
-        shard_pattern = os.path.join(dataset_path, "training_shard_*.npy")
+        shard_pattern = os.path.join(dataset_path, f"{split}_shard_*.npy")
         all_shards = sorted(glob.glob(shard_pattern))
         
         if len(all_shards) == 0:
@@ -31,6 +32,7 @@ class FineWebDataLoader:
         
         # Distribute shards across DDP ranks
         # Each rank gets a subset of shards
+        
         shards_per_rank = len(all_shards) // ddp_world_size
         start_idx = ddp_rank * shards_per_rank
         if ddp_rank == ddp_world_size - 1:
@@ -39,8 +41,15 @@ class FineWebDataLoader:
         else:
             self.shard_files = all_shards[start_idx:start_idx + shards_per_rank]
         
+        # temporary fix because have just 1 validaiton shard and only the master needs it
+        if split == "validation":
+            if ddp_world_size == 1 or ddp_rank == 0:
+                self.shard_files = all_shards
+            else:
+                self.shard_files = []
+        
         if len(self.shard_files) == 0:
-            raise ValueError(f"No shards assigned to rank {ddp_rank}")
+            raise ValueError(f"No shards assigned to rank {ddp_rank} for split {split}")
         
         self.current_shard_idx = 0
         self.current_shard_data = None
