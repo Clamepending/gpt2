@@ -1,33 +1,74 @@
 import torch
-import tiktoken
-from datatrove.pipeline.readers import ParquetReader
+import numpy as np
+import os
+import glob
 
 class FineWebDataLoader:
     def __init__(self, B, T, ddp_rank=0, ddp_world_size=1, 
-                 dataset_path="hf://datasets/HuggingFaceFW/fineweb/data",
-                 buffer_size=1000000, limit=None):
+                 dataset_path="fineweb-edu/gpt2_numpy",
+                 buffer_size=1000000):
         self.B, self.T = B, T
         self.ddp_rank, self.ddp_world_size = ddp_rank, ddp_world_size
         self.buffer_size = buffer_size
+        
+        # Resolve the dataset path (handle symlink)
+        if os.path.islink(dataset_path):
+            dataset_path = os.path.realpath(dataset_path)
+        elif not os.path.isabs(dataset_path):
+            # If relative path, try to resolve from current directory
+            abs_path = os.path.abspath(dataset_path)
+            if os.path.exists(abs_path):
+                dataset_path = abs_path
+        
         self.dataset_path = dataset_path
         
-        self.tokenizer = tiktoken.get_encoding("gpt2")
-        self.eot_token = self.tokenizer.eot_token
+        # Find all numpy shard files
+        shard_pattern = os.path.join(dataset_path, "training_shard_*.npy")
+        all_shards = sorted(glob.glob(shard_pattern))
         
-        # ParquetReader expects limit to be an int or -1, not None
-        self.limit = -1
-        self.data_reader = ParquetReader(dataset_path, limit=self.limit)
-        self.data_iterator = iter(self.data_reader(rank=ddp_rank, world_size=ddp_world_size))
+        if len(all_shards) == 0:
+            raise ValueError(f"No numpy shards found in {dataset_path}")
+        
+        # Distribute shards across DDP ranks
+        # Each rank gets a subset of shards
+        shards_per_rank = len(all_shards) // ddp_world_size
+        start_idx = ddp_rank * shards_per_rank
+        if ddp_rank == ddp_world_size - 1:
+            # Last rank gets any remaining shards
+            self.shard_files = all_shards[start_idx:]
+        else:
+            self.shard_files = all_shards[start_idx:start_idx + shards_per_rank]
+        
+        if len(self.shard_files) == 0:
+            raise ValueError(f"No shards assigned to rank {ddp_rank}")
+        
+        self.current_shard_idx = 0
+        self.current_shard_data = None
+        self.current_shard_pos = 0
         
         # The main tensor buffer
         self.token_buffer = torch.zeros(buffer_size + B * T + 1, dtype=torch.long)
         self.buffer_fill = 0 
         self.current_pos = 0 
         
-        # NEW: Store tokens from a document that haven't been put in the buffer yet
+        # Store tokens from a shard that haven't been put in the buffer yet
         self.remainder = torch.tensor([], dtype=torch.long)
 
         self._fill_buffer()
+    
+    def _load_next_shard(self):
+        """Load the next shard in rotation."""
+        # Only load if we don't have a shard or current shard is exhausted
+        if self.current_shard_data is None or self.current_shard_pos >= len(self.current_shard_data):
+            # Load next shard
+            shard_file = self.shard_files[self.current_shard_idx]
+            self.current_shard_data = np.load(shard_file)
+            # Convert to torch tensor and ensure it's long dtype
+            self.current_shard_data = torch.from_numpy(self.current_shard_data).long()
+            self.current_shard_pos = 0
+            
+            # Move to next shard (with wrap-around)
+            self.current_shard_idx = (self.current_shard_idx + 1) % len(self.shard_files)
         
     def _fill_buffer(self):
         # 1. Shift unused tokens to the start
@@ -39,24 +80,18 @@ class FineWebDataLoader:
         self.current_pos = 0
 
         while self.buffer_fill < self.buffer_size:
-            # 2. Check if we have leftover tokens from the PREVIOUS document
+            # 2. Check if we have leftover tokens from the PREVIOUS shard
             if len(self.remainder) > 0:
                 t_tokens = self.remainder
                 self.remainder = torch.tensor([], dtype=torch.long) # Clear it
+                from_shard = False
             else:
-                # 3. Otherwise, fetch a NEW document
-                try:
-                    doc = next(self.data_iterator)
-                    text = doc.text if hasattr(doc, 'text') else str(doc)
-                    tokens = self.tokenizer.encode(text)
-                    tokens.append(self.eot_token)
-                    t_tokens = torch.tensor(tokens, dtype=torch.long)
-                except StopIteration:
-                    # Recreate the reader and iterator when dataset is exhausted
-                    self.data_reader = ParquetReader(self.dataset_path, limit=self.limit)
-                    self.data_iterator = iter(self.data_reader(rank=self.ddp_rank, world_size=self.ddp_world_size))
-                    if self.buffer_fill == 0: break
-                    continue
+                # 3. Otherwise, load tokens from the current shard
+                self._load_next_shard()
+                
+                # Get tokens from current position in shard
+                t_tokens = self.current_shard_data[self.current_shard_pos:]
+                from_shard = True
 
             # 4. Determine how much fits
             space_left = self.token_buffer.size(0) - self.buffer_fill
@@ -64,11 +99,17 @@ class FineWebDataLoader:
                 # It all fits!
                 self.token_buffer[self.buffer_fill : self.buffer_fill + len(t_tokens)] = t_tokens
                 self.buffer_fill += len(t_tokens)
+                # Update shard position if we consumed from shard
+                if from_shard:
+                    self.current_shard_pos += len(t_tokens)
             else:
                 # It doesn't all fit. Take what we can and save the rest in remainder.
                 self.token_buffer[self.buffer_fill : self.buffer_fill + space_left] = t_tokens[:space_left]
                 self.remainder = t_tokens[space_left:] # Save for next loop/call
                 self.buffer_fill += space_left
+                # Update shard position if we consumed from shard
+                if from_shard:
+                    self.current_shard_pos += space_left
 
     def get_batch(self):
         req = self.B * self.T

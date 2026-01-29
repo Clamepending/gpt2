@@ -4,37 +4,56 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 import inspect
+from fineweb_dataloader import FineWebDataLoader
 
-
-
-
-
-
-class DataloaderLite:
-    def __init__(self, B, T, ddp_rank, ddp_world_size):
-        #downlaod tiny shakespeare dataset from https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-        import requests
-        url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-        response = requests.get(url)
-        text = response.text
-        self.text = torch.tensor(tokenizer.encode(text), dtype = torch.long)
-        self.current_pos = ddp_rank * B * T
-        self.B = B
-        self.T = T
-        self.ddp_world_size = ddp_world_size
+# class DataloaderLite:
+#     def __init__(self, B, T, ddp_rank, ddp_world_size):
+#         #downlaod tiny shakespeare dataset from https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+#         import requests
+#         url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+#         response = requests.get(url)
+#         text = response.text
+#         self.text = torch.tensor(tokenizer.encode(text), dtype = torch.long)
+#         self.current_pos = ddp_rank * B * T
+#         self.B = B
+#         self.T = T
+#         self.ddp_world_size = ddp_world_size
         
-    def get_batch(self):
-        buf = self.text[self.current_pos:self.current_pos+self.B*self.T+1]
-        x = buf[:-1].view(self.B, self.T)
-        y = buf[1:].view(self.B, self.T)
+#     def get_batch(self):
+#         buf = self.text[self.current_pos:self.current_pos+self.B*self.T+1]
+#         x = buf[:-1].view(self.B, self.T)
+#         y = buf[1:].view(self.B, self.T)
         
-        self.current_pos += self.B*self.T * self.ddp_world_size
-        if self.current_pos + self.B*self.T*self.ddp_world_size >= len(self.text):
-            self.current_pos = 0
-        return x, y
-        
-        
+#         self.current_pos += self.B*self.T * self.ddp_world_size
+#         if self.current_pos + self.B*self.T*self.ddp_world_size >= len(self.text):
+#             self.current_pos = 0
+#         return x, y
 
+# DDP
+from torch.distributed import init_process_group, destroy_process_group
+
+import os
+ddp = int(os.environ.get("RANK", -1)) != -1
+if ddp:
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    
+    master_process = ddp_rank == 0
+    
+    torch.cuda.set_device(f'cuda:{ddp_local_rank}')
+    device = torch.device(f'cuda:{ddp_local_rank}')
+    init_process_group(backend="nccl")
+else:
+    ddp_rank = 0
+    ddp_local_rank =0 
+    ddp_world_size = 1
+    master_process = True
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
 
 @dataclass
 class GPT2config:
@@ -45,6 +64,18 @@ class GPT2config:
     block_size: int = 1024
     
     
+@dataclass
+class TrainingConfig:
+    total_batch_size: int = 524288
+    B: int = 4
+    T: int = 1024
+    grad_accumulation_steps: int = total_batch_size // (B * T * ddp_world_size)
+    max_steps: int = 50 # total number of training steps
+    max_lr: float = 6e-4 # maximum learning rate for cosine schedule
+    min_lr: float = max_lr * 0.1 # minimum learning rate for cosine schedule
+    warmup_steps: int = 10 # number of warmup steps
+    weight_decay: float = 0.1 # weight decay (no bias decay)
+train_config = TrainingConfig()
     
     
 class CausalSelfAttention(nn.Module):
@@ -101,8 +132,6 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-
-    
 class GPT2(nn.Module):
     def __init__(self, config: GPT2config):
         super().__init__()
@@ -134,7 +163,6 @@ class GPT2(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean = 0.0, std = std)
             
-            
     def configure_optimizers(self, weight_decay, learning_rate, device):
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
@@ -155,9 +183,6 @@ class GPT2(nn.Module):
         print(f"Using fused AdamW: {use_fused}")
         return torch.optim.AdamW(optim_groups, lr = learning_rate, betas = (0.9, 0.95), eps = 1e-8, fused = use_fused)
         
-        
-        
-        
     def forward(self, idx, targets = None):
         B, T = idx.size()
         pos = torch.arange(0, T, dtype = torch.long, device = idx.device)
@@ -177,24 +202,20 @@ class GPT2(nn.Module):
 # --------------------------------------------------
 
 
-warmup_steps = 10
-max_steps = 50
-max_lr = 6e-4
-min_lr = max_lr * 0.1
+
 def get_lr(it):
-    if it < warmup_steps:
-        return max_lr * (it + 1)/warmup_steps
-    if it > max_steps:
-        return min_lr
+    if it < train_config.warmup_steps:
+        return train_config.max_lr * (it + 1)/train_config.warmup_steps
+    if it > train_config.max_steps:
+        return train_config.min_lr
     
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    decay_ratio = (it - train_config.warmup_steps) / (train_config.max_steps - train_config.warmup_steps)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (max_lr - min_lr)
+    return train_config.min_lr + coeff * (train_config.max_lr - train_config.min_lr)
     
 
-num_return_sequences = 5
-max_length = 30
+
 
 
 
@@ -203,41 +224,10 @@ tokenizer = tiktoken.get_encoding("gpt2")
 
 
 
-# DDP
-from torch.distributed import init_process_group, destroy_process_group
-
-import os
-ddp = int(os.environ.get("RANK", -1)) != -1
-if ddp:
-    ddp_rank = int(os.environ["RANK"])
-    ddp_local_rank = int(os.environ["LOCAL_RANK"])
-    ddp_world_size = int(os.environ["WORLD_SIZE"])
-    
-    master_process = ddp_rank == 0
-    
-    torch.cuda.set_device(f'cuda:{ddp_local_rank}')
-    device = torch.device(f'cuda:{ddp_local_rank}')
-    init_process_group(backend="nccl")
-else:
-    ddp_rank = 0
-    ddp_local_rank =0 
-    ddp_world_size = 1
-    master_process = True
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    
 
 
-
-
-
-
-
-torch.manual_seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(42)
-
-shakespeare_dataset = DataloaderLite(4, 1024, ddp_rank, ddp_world_size)
+# shakespeare_dataset = DataloaderLite(4, 1024, ddp_rank, ddp_world_size)
+fineweb_dataset = FineWebDataLoader(B=4, T=1024, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size)
 
 
 
@@ -251,38 +241,39 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model
 
-total_batch_size = 524288
-B = 4
-T = 1024
-assert total_batch_size % (B * T * ddp_world_size) == 0
-grad_accumulation_steps = total_batch_size // (B * T * ddp_world_size)
-print(f"Total batch size: {total_batch_size}, Grad accumulation steps: {grad_accumulation_steps}")
 
+assert train_config.total_batch_size % (train_config.B * train_config.T * ddp_world_size) == 0
+print(f"Total batch size: {train_config.total_batch_size}, Grad accumulation steps: {train_config.grad_accumulation_steps}")
 import time
-optimizer = raw_model.configure_optimizers(weight_decay = 0.1, learning_rate = 6e-4, device = device)
-for step in range(50):
+losses = torch.zeros(train_config.max_steps, device = device)
+perplexity = torch.zeros(train_config.max_steps, device = device)
+
+optimizer = raw_model.configure_optimizers(weight_decay = train_config.weight_decay, learning_rate = train_config.max_lr, device = device)
+for step in range(train_config.max_steps):
     start_time = time.time()
     optimizer.zero_grad()
     loss_accumulated = 0
-    for micro_step in range(grad_accumulation_steps):
-        x, y = shakespeare_dataset.get_batch()
+    for micro_step in range(train_config.grad_accumulation_steps):
+        x, y = fineweb_dataset.get_batch()
         x = x.to(device)
         y = y.to(device)
-        if ddp and micro_step != grad_accumulation_steps - 1: # don't sync gradients until the last micro_step
+        if ddp and micro_step != train_config.grad_accumulation_steps - 1: # don't sync gradients until the last micro_step
             with model.no_sync():
                 with torch.autocast(device_type = device.type, dtype = torch.bfloat16):
                     logits, loss = model(x, y)
-                loss = loss / grad_accumulation_steps
+                loss = loss / train_config.grad_accumulation_steps
                 loss.backward()
         else:
             with torch.autocast(device_type = device.type, dtype = torch.bfloat16):
                 logits, loss = model(x, y)
-            loss = loss / grad_accumulation_steps
+            loss = loss / train_config.grad_accumulation_steps
             loss.backward()
         loss_accumulated += loss.detach()
     
     if ddp:
         torch.distributed.all_reduce(loss_accumulated, op = torch.distributed.ReduceOp.AVG) # average the loss across all devices
+    losses[step] = loss_accumulated.item()
+    perplexity[step] = torch.exp(losses[step])
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param in optimizer.param_groups:
@@ -291,10 +282,13 @@ for step in range(50):
     torch.cuda.synchronize()
     end_time = time.time()
     if not ddp or master_process:
-        tokens_processed = shakespeare_dataset.B*shakespeare_dataset.T*grad_accumulation_steps*ddp_world_size
-        print(f"Step {step}: loss {loss_accumulated.item():.6f}, lr {lr:.6f}, time {end_time - start_time}, norm {norm: .4f}, tokens per second {tokens_processed:.2f}")
-    
+        tokens_processed = fineweb_dataset.B*fineweb_dataset.T*train_config.grad_accumulation_steps*ddp_world_size
+        print(f"Step {step}: loss {loss_accumulated.item():.6f}, lr {lr:.6f}, time {end_time - start_time}, norm {norm: .4f}, tokens per second {tokens_processed/(end_time - start_time):.2f}, perplexity {perplexity[step]:.2f}")
 
+
+
+num_return_sequences = 5
+max_length = 30
 # sample
 if not ddp or master_process:
     tokens = tokenizer.encode("Hello, I'm a language model,")
@@ -323,5 +317,3 @@ if not ddp or master_process:
 
 if ddp:
     destroy_process_group()
-
-
