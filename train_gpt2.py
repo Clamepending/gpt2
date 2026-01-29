@@ -5,6 +5,8 @@ from torch.nn import functional as F
 import math
 import inspect
 from fineweb_dataloader import FineWebDataLoader
+import wandb
+
 
 # class DataloaderLite:
 #     def __init__(self, B, T, ddp_rank, ddp_world_size):
@@ -70,12 +72,21 @@ class TrainingConfig:
     B: int = 4
     T: int = 1024
     grad_accumulation_steps: int = total_batch_size // (B * T * ddp_world_size)
-    max_steps: int = 50 # total number of training steps
+    max_steps: int = 100 # total number of training steps
     max_lr: float = 6e-4 # maximum learning rate for cosine schedule
     min_lr: float = max_lr * 0.1 # minimum learning rate for cosine schedule
     warmup_steps: int = 10 # number of warmup steps
     weight_decay: float = 0.1 # weight decay (no bias decay)
+    sample_interval: int = 20 # interval to sample from the model
+    num_samples_per_interval: int = 5 # number of samples to generate per interval
+    sample_max_length: int = 50 # maximum length of the generated samples including prompt
+
 train_config = TrainingConfig()
+if not ddp or master_process:
+    wandb.init(project="gpt2", config=train_config)
+    assert train_config.total_batch_size % (train_config.B * train_config.T * ddp_world_size) == 0
+    print(f"Total batch size: {train_config.total_batch_size}, Grad accumulation steps: {train_config.grad_accumulation_steps}")
+
     
     
 class CausalSelfAttention(nn.Module):
@@ -175,12 +186,16 @@ class GPT2(nn.Module):
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num_decay_params: {num_decay_params}, num_nodecay_params: {num_nodecay_params}")
+        
         
         
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device.type == "cuda"
-        print(f"Using fused AdamW: {use_fused}")
+        
+        if not ddp or master_process:
+            print(f"num_decay_params: {num_decay_params}, num_nodecay_params: {num_nodecay_params}")
+            print(f"Using fused AdamW: {use_fused}")
+        
         return torch.optim.AdamW(optim_groups, lr = learning_rate, betas = (0.9, 0.95), eps = 1e-8, fused = use_fused)
         
     def forward(self, idx, targets = None):
@@ -201,7 +216,28 @@ class GPT2(nn.Module):
 
 # --------------------------------------------------
 
+def sample_from_model(model, prompt, num_return_sequences, max_length) -> list[str]:
+    tokens = tokenizer.encode(prompt)
+    tokens = torch.tensor(tokens, dtype = torch.long)
+    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+    x = tokens.to(device)
 
+    with torch.inference_mode():
+        while x.size(1) < max_length:
+            logits, _ = raw_model(x) # B T V - use raw_model for inference to avoid DDP collectives
+            logits = logits[:,-1,:] # B V
+            
+            probs = F.softmax(logits, dim=-1) # B V
+            
+            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # B 50
+            
+            ix = torch.multinomial(topk_probs, 1) # B 1
+            
+            x_next = torch.gather(topk_indices, 1, ix) # B 1
+            
+            x = torch.cat((x, x_next), dim=1) # B T+1
+            
+    return tokenizer.decode_batch(x.tolist())
 
 def get_lr(it):
     if it < train_config.warmup_steps:
@@ -242,11 +278,11 @@ if ddp:
 raw_model = model.module if ddp else model
 
 
-assert train_config.total_batch_size % (train_config.B * train_config.T * ddp_world_size) == 0
-print(f"Total batch size: {train_config.total_batch_size}, Grad accumulation steps: {train_config.grad_accumulation_steps}")
+
 import time
 losses = torch.zeros(train_config.max_steps, device = device)
 perplexity = torch.zeros(train_config.max_steps, device = device)
+tokens_processed = 0
 
 optimizer = raw_model.configure_optimizers(weight_decay = train_config.weight_decay, learning_rate = train_config.max_lr, device = device)
 for step in range(train_config.max_steps):
@@ -282,36 +318,28 @@ for step in range(train_config.max_steps):
     torch.cuda.synchronize()
     end_time = time.time()
     if not ddp or master_process:
-        tokens_processed = fineweb_dataset.B*fineweb_dataset.T*train_config.grad_accumulation_steps*ddp_world_size
-        print(f"Step {step}: loss {loss_accumulated.item():.6f}, lr {lr:.6f}, time {end_time - start_time}, norm {norm: .4f}, tokens per second {tokens_processed/(end_time - start_time):.2f}, perplexity {perplexity[step]:.2f}")
+        tokens_processed += fineweb_dataset.B*fineweb_dataset.T*train_config.grad_accumulation_steps*ddp_world_size
+        print(f"Step {step}: loss {loss_accumulated.item():.6f}, lr {lr:.6f}, time {end_time - start_time}, norm {norm: .4f}, tokens per second {fineweb_dataset.B*fineweb_dataset.T*train_config.grad_accumulation_steps*ddp_world_size/(end_time - start_time):.2f}, perplexity {perplexity[step]:.2f}")
+        wandb.log({"train/loss": losses[step],
+                   "train/lr": lr,
+                   "train/norm": norm,
+                   "train/tokens_per_second": fineweb_dataset.B*fineweb_dataset.T*train_config.grad_accumulation_steps*ddp_world_size/(end_time - start_time),
+                   "train/perplexity": perplexity[step],
+                   "train/tokens_processed": tokens_processed},
+                    step=step)
+        if step % train_config.sample_interval == 0:
+            responses = sample_from_model(model, "Hello, I'm a language model,", train_config.num_samples_per_interval, train_config.sample_max_length)
+            table_data = [(step, response) for response in responses]
+            table = wandb.Table(data=table_data, columns=["step", "sample"])
+            wandb.log({"samples": table}, step=step)
+            # sample from the model
 
-
-
-num_return_sequences = 5
-max_length = 30
-# sample
 if not ddp or master_process:
-    tokens = tokenizer.encode("Hello, I'm a language model,")
-    tokens = torch.tensor(tokens, dtype = torch.long)
-    tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-    x = tokens.to(device)
+    wandb.finish()
 
-    with torch.no_grad():
-        while x.size(1) < max_length:
-            logits, _ = raw_model(x) # B T V - use raw_model for inference to avoid DDP collectives
-            logits = logits[:,-1,:] # B V
-            
-            probs = F.softmax(logits, dim=-1) # B V
-            
-            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) # B 50
-            
-            ix = torch.multinomial(topk_probs, 1) # B 1
-            
-            x_next = torch.gather(topk_indices, 1, ix) # B 1
-            
-            x = torch.cat((x, x_next), dim=1) # B T+1
-            
-    decoded = tokenizer.decode_batch(x.tolist())
+# print samples to terminal
+if not ddp or master_process:
+    decoded = sample_from_model(model, "Hello, I'm a language model,", 5, 30)
     for d in decoded:
         print(d)
 
