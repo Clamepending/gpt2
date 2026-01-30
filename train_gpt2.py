@@ -40,8 +40,8 @@ if torch.cuda.is_available():
 @dataclass
 class TrainingConfig:
     total_batch_size: int = 524288
-    B: int = 32 # 4
-    T: int = 2048 # 1024
+    B: int = 8 # 4
+    T: int = 1024 # 2048
     grad_accumulation_steps: int = total_batch_size // (B * T * ddp_world_size)
     max_steps: int = 10_000 # total number of training steps
     max_lr: float = 2e-3 # maximum learning rate for cosine schedule (original 6e-4)
@@ -176,7 +176,7 @@ if not ddp or master_process:
 
 torch.set_float32_matmul_precision("high")
 
-model = GPT2(GPT2config(vocab_size = 50304)).to(device)
+model = GPT2(GPT2config(vocab_size=50304, block_size=train_config.T)).to(device)
 model = torch.compile(model)
 
 from torch.nn.parallel import DistributedDataParallel as DDP
