@@ -7,7 +7,7 @@ Source: asquirous/fineweb_sample_10B_np_bin
 - train.bin ~23.5 GB (uint16 token IDs)
 - val.bin ~12 MB
 
-Note: The source .bin files were tokenized with TinyLlama tokenizer. For GPT-2
+Note:For GPT-2
 training you may want to use tiktoken; in that case consider downloading
 HuggingFaceFW/fineweb (sample-10BT parquet) and tokenizing locally with tiktoken.
 

@@ -1,0 +1,57 @@
+"""Load checkpoint from wandb (online) and sample. Uses only the downloaded artifact, not local files."""
+from pathlib import Path
+import torch
+from torch.nn import functional as F
+import tiktoken
+import wandb
+from model import GPT2, GPT2config
+
+def load_model():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    config = GPT2config(vocab_size=50304)
+    model = GPT2(config).to(device)
+
+    # Download from wandb (online) only; do not use local checkpoints/
+    artifact = wandb.Api().artifact("gpt2/checkpoint-step-18000:v0")
+    root = artifact.download(root=".")  # returns path to downloaded contents
+    state = torch.load(Path(root) / "checkpoint_step_18000.pt", map_location=device, weights_only=True)
+
+    prefix = "_orig_mod."
+    state = {k.removeprefix(prefix): v for k, v in state["model"].items() if k.startswith(prefix)}
+    model.load_state_dict(state, strict=True)
+
+    return model
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
+model = load_model().to(device)
+tokenizer = tiktoken.get_encoding("gpt2")
+
+prompt, max_len = "Hello, I'm a language model,", 200
+
+def sample_from_model_stream(model, prompt, max_len):
+    x = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
+    next_tok = None
+    with torch.inference_mode():
+        while x.size(1) < max_len and (next_tok is None or next_tok.item() != 50256):
+            logits, _ = model(x)
+            probs = F.softmax(logits[:, -1], dim=-1)
+            top_p, top_idx = torch.topk(probs, 50)
+            next_tok = top_idx.gather(-1, torch.multinomial(top_p, 1))
+            x = torch.cat([x, next_tok], dim=1)
+            print(tokenizer.decode([next_tok.item()]), end="", flush=True)
+
+
+while True:
+    user_input = input("\nEnter a prompt: ")
+    if user_input == "exit":
+        break
+    print("\nmodel response:")
+    sample_from_model_stream(model, user_input, max_len)
+
