@@ -42,15 +42,15 @@ class TrainingConfig:
     B: int = 4
     T: int = 1024
     grad_accumulation_steps: int = total_batch_size // (B * T * ddp_world_size)
-    max_steps: int = 10_000 # total number of training steps
+    max_steps: int = 80_000 # total number of training steps
     max_lr: float = 6e-4 # maximum learning rate for cosine schedule
     min_lr: float = max_lr * 0.1 # minimum learning rate for cosine schedule
     warmup_steps: int = 10 # number of warmup steps
     weight_decay: float = 0.1 # weight decay (no bias decay)
-    sample_interval: int = 2000 # interval to sample from the model
+    sample_interval: int = 20 # interval to sample from the model
     num_samples_per_interval: int = 5 # number of samples to generate per interval
     sample_max_length: int = 50 # maximum length of the generated samples including prompt
-    save_interval: int = 2000 # interval to save the model checkpoint
+    save_interval: int = 20 # interval to save the model checkpoint
 
 train_config = TrainingConfig()
 if not ddp or master_process:
