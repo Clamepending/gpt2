@@ -39,7 +39,7 @@ if torch.cuda.is_available():
     
 @dataclass
 class TrainingConfig:
-    total_batch_size: int = 524288
+    total_batch_size: int = 524288 * 3//4 # to get 6 4090s to train
     B: int = 8 # 4
     T: int = 1024 # 2048
     grad_accumulation_steps: int = total_batch_size // (B * T * ddp_world_size)
