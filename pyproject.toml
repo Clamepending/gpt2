@@ -1,4 +1,4 @@
 [project]
 name = "gpt2"
 version = "0.1.0"
-dependencies = ["tiktoken", "torch", "numpy", "wandb"]
+dependencies = ["tiktoken", "torch", "numpy", "wandb", "huggingface_hub"]

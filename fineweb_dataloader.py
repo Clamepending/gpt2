@@ -5,7 +5,7 @@ import glob
 
 class FineWebDataLoader:
     def __init__(self, B, T, ddp_rank=0, ddp_world_size=1, 
-                 dataset_path="fineweb-edu/gpt2_numpy",
+                 dataset_path="fineweb_sample_10B",
                  buffer_size=1000000,
                  split="training"):
         self.B, self.T = B, T

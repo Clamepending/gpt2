@@ -7,3 +7,5 @@ checkpoints/
 
 *.pt
 *.pkl
+
+fineweb_sample_10B/

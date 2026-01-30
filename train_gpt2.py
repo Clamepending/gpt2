@@ -42,7 +42,7 @@ class TrainingConfig:
     B: int = 4
     T: int = 1024
     grad_accumulation_steps: int = total_batch_size // (B * T * ddp_world_size)
-    max_steps: int = 10,000 # total number of training steps
+    max_steps: int = 10_000 # total number of training steps
     max_lr: float = 6e-4 # maximum learning rate for cosine schedule
     min_lr: float = max_lr * 0.1 # minimum learning rate for cosine schedule
     warmup_steps: int = 10 # number of warmup steps
