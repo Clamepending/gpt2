@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
+import torch.nn as nn
 from torch.nn import functional as F
 import math
 import inspect
@@ -39,18 +40,19 @@ if torch.cuda.is_available():
 @dataclass
 class TrainingConfig:
     total_batch_size: int = 524288
-    B: int = 4
-    T: int = 1024
+    B: int = 32 # 4
+    T: int = 2048 # 1024
     grad_accumulation_steps: int = total_batch_size // (B * T * ddp_world_size)
-    max_steps: int = 80_000 # total number of training steps
-    max_lr: float = 6e-4 # maximum learning rate for cosine schedule
+    max_steps: int = 10_000 # total number of training steps
+    max_lr: float = 2e-3 # maximum learning rate for cosine schedule (original 6e-4)
     min_lr: float = max_lr * 0.1 # minimum learning rate for cosine schedule
     warmup_steps: int = 10 # number of warmup steps
     weight_decay: float = 0.1 # weight decay (no bias decay)
     sample_interval: int = 20 # interval to sample from the model
     num_samples_per_interval: int = 5 # number of samples to generate per interval
     sample_max_length: int = 50 # maximum length of the generated samples including prompt
-    save_interval: int = 20 # interval to save the model checkpoint
+    save_interval: int = 2000 # interval to save the model checkpoint
+    resume_path: str | None = None  # path to checkpoint .pt to resume from (e.g. checkpoints/model_step_2000.pt)
 
 train_config = TrainingConfig()
 if not ddp or master_process:
@@ -86,16 +88,65 @@ def sample_from_model(model, prompt, num_return_sequences, max_length) -> list[s
             
     return tokenizer.decode_batch(x.tolist())
 
-def log_checkpoint_artifact(model: GPT2, step: int) -> None:
-    # Save to project-level checkpoints/ so files are easy to find
-    checkpoint_dir = Path.cwd() / "checkpoints"
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    checkpoint_dir: Path | None = None,
+    rng_states: dict | None = None,
+) -> Path:
+    """Save full training state (model, optimizer, step, RNG) for resumption."""
+    if checkpoint_dir is None:
+        checkpoint_dir = Path.cwd() / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = checkpoint_dir / f"model_step_{step}.pt"
-    torch.save(model.state_dict(), checkpoint_path)
+    checkpoint_path = checkpoint_dir / f"checkpoint_step_{step}.pt"
+
+    raw = model.module if hasattr(model, "module") else model
+    state = {
+        "model": raw.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": step,
+    }
+    if rng_states is not None:
+        state["rng"] = rng_states
+
+    torch.save(state, checkpoint_path)
+    return checkpoint_path
+
+
+def load_checkpoint(
+    path: str | Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> tuple[int, dict | None]:
+    """Load checkpoint; returns (step to resume from, rng_states or None)."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    raw = model.module if hasattr(model, "module") else model
+    raw.load_state_dict(ckpt["model"], strict=True)
+    optimizer.load_state_dict(ckpt["optimizer"])
+    rng = ckpt.get("rng")
+    if rng is not None:
+        if "cpu" in rng:
+            torch.set_rng_state(rng["cpu"])
+        if "cuda" in rng:
+            torch.cuda.set_rng_state_all(rng["cuda"])
+    return int(ckpt["step"]), rng
+
+
+def log_checkpoint_artifact(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    rng_states: dict | None = None,
+) -> None:
+    # Save full checkpoint to project-level checkpoints/
+    checkpoint_dir = Path.cwd() / "checkpoints"
+    checkpoint_path = save_checkpoint(model, optimizer, step, checkpoint_dir, rng_states)
 
     if wandb.run is not None:
         artifact = wandb.Artifact(
-            name=f"model-checkpoint-step-{step}",
+            name=f"checkpoint-step-{step}",
             type="model",
             metadata={"step": step},
         )
@@ -141,7 +192,20 @@ losses = torch.zeros(train_config.max_steps, device = device)
 tokens_processed = 0
 
 optimizer = raw_model.configure_optimizers(weight_decay = train_config.weight_decay, learning_rate = train_config.max_lr, device = device)
-for step in range(train_config.max_steps):
+
+# Resume from checkpoint if requested
+start_step = 0
+if train_config.resume_path:
+    resume_path = Path(train_config.resume_path)
+    if resume_path.exists():
+        start_step, _ = load_checkpoint(resume_path, model, optimizer, device)
+        start_step += 1  # next step to run
+        if not ddp or master_process:
+            print(f"Resumed from {resume_path}, starting at step {start_step}")
+    else:
+        raise FileNotFoundError(f"Resume path not found: {resume_path}")
+
+for step in range(start_step, train_config.max_steps):
     start_time = time.time()
     optimizer.zero_grad()
     loss_accumulated = 0
@@ -199,8 +263,13 @@ for step in range(train_config.max_steps):
                 wandb.log({"samples": table}, step=step)
                 
         # save checkpoint (only on master when using DDP)
-        if step % train_config.save_interval == 0:
-            log_checkpoint_artifact(model, step)
+        if step > 0 and step % train_config.save_interval == 0:
+            rng_states = {
+                "cpu": torch.get_rng_state(),
+            }
+            if torch.cuda.is_available():
+                rng_states["cuda"] = torch.cuda.get_rng_state_all()
+            log_checkpoint_artifact(model, optimizer, step, rng_states)
 
 if not ddp or master_process:
     wandb.finish()
