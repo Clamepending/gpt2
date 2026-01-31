@@ -114,26 +114,6 @@ def save_checkpoint(
     return checkpoint_path
 
 
-def load_checkpoint(
-    path: str | Path,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-) -> tuple[int, dict | None]:
-    """Load checkpoint; returns (step to resume from, rng_states or None)."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    raw = model.module if hasattr(model, "module") else model
-    raw.load_state_dict(ckpt["model"], strict=True)
-    optimizer.load_state_dict(ckpt["optimizer"])
-    rng = ckpt.get("rng")
-    if rng is not None:
-        if "cpu" in rng:
-            torch.set_rng_state(rng["cpu"])
-        if "cuda" in rng:
-            torch.cuda.set_rng_state_all(rng["cuda"])
-    return int(ckpt["step"]), rng
-
-
 def log_checkpoint_artifact(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -187,25 +167,12 @@ raw_model = model.module if ddp else model
 
 
 import time
-losses = torch.zeros(train_config.max_steps, device = device)
 # perplexity = torch.zeros(train_config.max_steps, device = device)
 tokens_processed = 0
 
 optimizer = raw_model.configure_optimizers(weight_decay = train_config.weight_decay, learning_rate = train_config.max_lr, device = device)
 
-# Resume from checkpoint if requested
-start_step = 0
-if train_config.resume_path:
-    resume_path = Path(train_config.resume_path)
-    if resume_path.exists():
-        start_step, _ = load_checkpoint(resume_path, model, optimizer, device)
-        start_step += 1  # next step to run
-        if not ddp or master_process:
-            print(f"Resumed from {resume_path}, starting at step {start_step}")
-    else:
-        raise FileNotFoundError(f"Resume path not found: {resume_path}")
-
-for step in range(start_step, train_config.max_steps):
+for step in range(1, train_config.max_steps + 1):
     start_time = time.time()
     optimizer.zero_grad()
     loss_accumulated = 0
@@ -228,7 +195,7 @@ for step in range(start_step, train_config.max_steps):
     
     if ddp:
         torch.distributed.all_reduce(loss_accumulated, op = torch.distributed.ReduceOp.AVG) # average the loss across all devices
-    losses[step] = loss_accumulated.item()
+    loss = loss_accumulated.item()
     # perplexity[step] = torch.exp(losses[step])
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
@@ -240,7 +207,7 @@ for step in range(start_step, train_config.max_steps):
     if not ddp or master_process:
         tokens_processed += train_config.B*train_config.T*train_config.grad_accumulation_steps*ddp_world_size
         print(f"Step {step}: loss {loss_accumulated.item():.6f}, lr {lr:.6f}, time {end_time - start_time}, norm {norm: .4f}, tokens per second {train_config.B*train_config.T*train_config.grad_accumulation_steps*ddp_world_size/(end_time - start_time):.2f}")
-        wandb.log({"train/loss": losses[step],
+        wandb.log({"train/loss": loss,
                    "train/lr": lr,
                    "train/norm": norm,
                    "train/tokens_per_second": train_config.B*train_config.T*train_config.grad_accumulation_steps*ddp_world_size/(end_time - start_time),

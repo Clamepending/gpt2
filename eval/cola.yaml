@@ -1,0 +1,17 @@
+
+tag: yes_or_no_tasks
+task: demo_cola
+dataset_path: glue
+dataset_name: cola
+output_type: multiple_choice
+training_split: train
+validation_split: validation
+doc_to_text: "{{sentence}}
+Question: Does this sentence make sense?
+Answer:"
+doc_to_target: label
+doc_to_choice: ["no", "yes"]
+should_decontaminate: true
+doc_to_decontamination_query: sentence
+metric_list:
+  - metric: acc
