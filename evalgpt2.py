@@ -1,7 +1,7 @@
 import lm_eval
 import json
 from lm_eval.utils import handle_non_serializable
-
+import os
 
 from lm_eval.api.model import LM
 import torch
@@ -70,86 +70,88 @@ class MyGPT2LM(LM):
         return per_token_log_probs.sum(dim=1), is_greedy_decoding
 
     def loglikelihood_rolling(self, requests):
-        
         raise NotImplementedError("loglikelihood_rolling is not implemented")
-        # INPUT:  requests = list[Instance], each req.args = (text: str,)
-        # OUTPUT: list[tuple[float]] — (log P(text | EOT),)
-        # out = []
-        # for req in requests:
-        #     (text,) = req.args
-        #     if not text:
-        #         out.append((0.0,))
-        #         continue
-        #     enc = self.tokenizer.encode(text)
-        #     # TODO: run model on [EOT] + enc[:-1], sum log P(enc), append (ll,)
-        #     out.append((0.0,))  # placeholder
-        # return out
 
     def generate_until(self, requests):
-        # INPUT:  requests = list[Instance], each req.args = (prefix: str, gen_kwargs: dict)
-        #        gen_kwargs has "until" (str or list[str]) and "max_gen_toks" (int)
-        # OUTPUT: list[str] — generated continuation for each request (stop strings stripped)
         raise NotImplementedError("generate_until is not implemented")
-        # out = []
-        # for req in requests:
-        #     prefix, kw = req.args
-        #     until = kw.get("until", ["\n"])
-        #     until = [until] if isinstance(until, str) else until
-        #     max_toks = kw.get("max_gen_toks", 256)
-        #     # TODO: encode prefix, autoregressively sample until EOT or until or max_toks,
-        #     #       decode and strip any until string from the end, append to out
-        #     out.append("")  # placeholder
-        # return out
 
     @property
     def batch_size(self):
         return self._batch_size
 
-from model import GPT2, GPT2config, load_model
+def get_hellaswag_estimates(model, batch_size=8, device=None, limit=100):
+    model = model.to(device)
+    model.eval()
+    my_gpt2_lm = MyGPT2LM(model, batch_size=batch_size, device=device)
+    results = lm_eval.simple_evaluate(
+        model=my_gpt2_lm,
+        model_args="pretrained=gpt2,dtype=float32",
+        tasks=["hellaswag"],
+        num_fewshot=5,
+        batch_size=batch_size,
+        limit=limit,
+        device=device,
+    )
+    return results["results"]["hellaswag"]["acc,none"], results["results"]["hellaswag"]["acc_norm,none"], results["results"]["hellaswag"]["acc_stderr,none"], results["results"]["hellaswag"]["acc_norm_stderr,none"]
 
-device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
-model = load_model()
-model = model.to(device)
-model.eval()
-my_gpt2_lm = MyGPT2LM(model, batch_size=8, device=device)
+if __name__ == "__main__":
+    limit = 100
 
-from lm_eval.api.instance import Instance
+    from model import GPT2, GPT2config, load_model
 
-# padded_tokens, batch_mask = my_gpt2_lm._calculate_padded_tokens_and_mask(
-#     [Instance(arguments=("Hello, I'm a language model,", " and I'm here to help you."), request_type=None, doc=None, idx=None), Instance(arguments=("cat", " is an animal."), request_type=None, doc=None, idx=None)]
-#     )
-# batch_log_probs, batch_is_greedy_decoding = my_gpt2_lm._batch_calculate_loglikelihood(padded_tokens, batch_mask)
-# print(batch_log_probs.tolist())
-# print(batch_is_greedy_decoding.tolist())
+    device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    model = load_model()
+    model = model.to(device)
+    model.eval()
+    my_gpt2_lm = MyGPT2LM(model, batch_size=8, device=device)
 
-results = lm_eval.simple_evaluate(
-    model=my_gpt2_lm,
-    model_args="pretrained=gpt2,dtype=float32",
-    tasks=["hellaswag"],
-    num_fewshot=5,
-    batch_size=8,
-    limit=100,
-    device=device,
-)
+    from lm_eval.api.instance import Instance
 
-with open("hellaswag_mygpt2_results.json", "w") as f:
-    json.dump(results, f, default=handle_non_serializable, indent=2)
-# print the results
-print(f"MyGPT2 LM Hellaswag accuracy: {results['results']['hellaswag']['acc,none']} (+/- {results['results']['hellaswag']['acc_stderr,none']}) Normalized: {results['results']['hellaswag']['acc_norm,none']} (+/- {results['results']['hellaswag']['acc_norm_stderr,none']})")
+    # padded_tokens, batch_mask = my_gpt2_lm._calculate_padded_tokens_and_mask(
+    #     [Instance(arguments=("Hello, I'm a language model,", " and I'm here to help you."), request_type=None, doc=None, idx=None), Instance(arguments=("cat", " is an animal."), request_type=None, doc=None, idx=None)]
+    #     )
+    # batch_log_probs, batch_is_greedy_decoding = my_gpt2_lm._batch_calculate_loglikelihood(padded_tokens, batch_mask)
+    # print(batch_log_probs.tolist())
+    # print(batch_is_greedy_decoding.tolist())
+
+    model = model.to(device)
+    model.eval()
+    my_gpt2_lm = MyGPT2LM(model, batch_size=8, device=device)
+    import time
+    start_time = time.time()
+    my_gpt2_lm_results = lm_eval.simple_evaluate(
+        model=my_gpt2_lm,
+        model_args="pretrained=gpt2,dtype=float32",
+        tasks=["hellaswag"],
+        num_fewshot=5,
+        batch_size=8,
+        limit=limit,
+        device=device,
+    )
+    end_time = time.time()
+    print(f"Time taken: {end_time - start_time} seconds")
+    
+    
+    # save to eval fodler
+    os.makedirs("eval", exist_ok=True)
+    with open("eval/hellaswag_mygpt2_results.json", "w") as f:
+        json.dump(my_gpt2_lm_results, f, default=handle_non_serializable, indent=2)
+    # print the results
+    print(f"MyGPT2 LM Hellaswag accuracy: {my_gpt2_lm_results['results']['hellaswag']['acc,none']} (+/- {my_gpt2_lm_results['results']['hellaswag']['acc_stderr,none']}) Normalized: {my_gpt2_lm_results['results']['hellaswag']['acc_norm,none']} (+/- {my_gpt2_lm_results['results']['hellaswag']['acc_norm_stderr,none']})")
 
 
 
-results = lm_eval.simple_evaluate(
-    model="hf",
-    model_args="pretrained=gpt2,dtype=float32",
-    tasks=["hellaswag"],
-    num_fewshot=5,
-    batch_size=8,
-    limit=100,
-    device=device,
-)
+    hf_gpt2_lm_results = lm_eval.simple_evaluate(
+        model="hf",
+        model_args="pretrained=gpt2,dtype=float32",
+        tasks=["hellaswag"],
+        num_fewshot=5,
+        batch_size=8,
+        limit=limit,
+        device=device,
+    )
 
-with open("hellaswag_hf_results.json", "w") as f:
-    json.dump(results, f, default=handle_non_serializable, indent=2)
-# print the results
-print(f"HF GPT2 LM Hellaswag accuracy: {results['results']['hellaswag']['acc,none']} (+/- {results['results']['hellaswag']['acc_stderr,none']}) Normalized: {results['results']['hellaswag']['acc_norm,none']} (+/- {results['results']['hellaswag']['acc_norm_stderr,none']})")
+    with open("eval/hellaswag_hf_results.json", "w") as f:
+        json.dump(hf_gpt2_lm_results, f, default=handle_non_serializable, indent=2)
+    # print the results
+    print(f"HF GPT2 LM Hellaswag accuracy: {hf_gpt2_lm_results['results']['hellaswag']['acc,none']} (+/- {hf_gpt2_lm_results['results']['hellaswag']['acc_stderr,none']}) Normalized: {hf_gpt2_lm_results['results']['hellaswag']['acc_norm,none']} (+/- {hf_gpt2_lm_results['results']['hellaswag']['acc_norm_stderr,none']})")

@@ -44,15 +44,17 @@ class TrainingConfig:
     T: int = 1024 # 2048
     grad_accumulation_steps: int = total_batch_size // (B * T * ddp_world_size)
     max_steps: int = 40_000 # total number of training steps 40k is around 13 hours on 4 4090s
+    
+    num_samples_per_interval: int = 5 # number of samples to generate per interval
+    sample_max_length: int = 50 # maximum length of the generated samples including prompt
+    save_interval: int = 2000 # interval to save the model checkpoint
+    hellaswag_eval_interval: int = 4000 # interval to evaluate the hellaswag accuracy
     max_lr: float = 2e-3 # maximum learning rate for cosine schedule (original 6e-4)
+    hellaswag_eval_limit: int = 100 # limit for the hellaswag evaluation
     min_lr: float = max_lr * 0.1 # minimum learning rate for cosine schedule
     warmup_steps: int = 10 # number of warmup steps
     weight_decay: float = 0.1 # weight decay (no bias decay)
     sample_interval: int = 20 # interval to sample from the model
-    num_samples_per_interval: int = 5 # number of samples to generate per interval
-    sample_max_length: int = 50 # maximum length of the generated samples including prompt
-    save_interval: int = 2000 # interval to save the model checkpoint
-    resume_path: str | None = None  # path to checkpoint .pt to resume from (e.g. checkpoints/model_step_2000.pt)
 
 train_config = TrainingConfig()
 if not ddp or master_process:
@@ -230,13 +232,19 @@ for step in range(1, train_config.max_steps + 1):
                 wandb.log({"samples": table}, step=step)
                 
         # save checkpoint (only on master when using DDP)
-        if step > 0 and step % train_config.save_interval == 0:
+        if step % train_config.save_interval == 0:
             rng_states = {
                 "cpu": torch.get_rng_state(),
             }
             if torch.cuda.is_available():
                 rng_states["cuda"] = torch.cuda.get_rng_state_all()
             log_checkpoint_artifact(model, optimizer, step, rng_states)
+        if step % train_config.hellaswag_eval_interval == 0:
+            acc, acc_norm, acc_stderr, acc_norm_stderr = get_hellaswag_estimates(model, batch_size=train_config.B, device=device, limit=train_config.hellaswag_eval_limit)
+            wandb.log({"validation/hellaswag/acc": acc,
+                       "validation/hellaswag/acc_norm": acc_norm,
+                       "validation/hellaswag/acc_stderr": acc_stderr,
+                       "validation/hellaswag/acc_norm_stderr": acc_norm_stderr}, step=step)
 
 if not ddp or master_process:
     wandb.finish()
