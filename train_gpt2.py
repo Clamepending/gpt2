@@ -9,6 +9,7 @@ from fineweb_dataloader import FineWebDataLoader
 import wandb
 from pathlib import Path
 from model import GPT2, GPT2config
+from evalgpt2 import get_hellaswag_estimates
 
 # DDP
 from torch.distributed import init_process_group, destroy_process_group
@@ -43,18 +44,18 @@ class TrainingConfig:
     B: int = 8 # 4
     T: int = 1024 # 2048
     grad_accumulation_steps: int = total_batch_size // (B * T * ddp_world_size)
-    max_steps: int = 40_000 # total number of training steps 40k is around 13 hours on 4 4090s
+    max_steps: int = 80_000 # total number of training steps 40k is around 13 hours on 4 4090s
     
     num_samples_per_interval: int = 5 # number of samples to generate per interval
     sample_max_length: int = 50 # maximum length of the generated samples including prompt
-    save_interval: int = 2000 # interval to save the model checkpoint
-    hellaswag_eval_interval: int = 4000 # interval to evaluate the hellaswag accuracy
+    save_interval: int = 5_000 # interval to save the model checkpoint
+    hellaswag_eval_interval: int = 2500 # interval to evaluate the hellaswag accuracy
     max_lr: float = 2e-3 # maximum learning rate for cosine schedule (original 6e-4)
-    hellaswag_eval_limit: int = 100 # limit for the hellaswag evaluation
+    hellaswag_eval_limit: int = 30 # limit for the hellaswag evaluation
     min_lr: float = max_lr * 0.1 # minimum learning rate for cosine schedule
     warmup_steps: int = 10 # number of warmup steps
     weight_decay: float = 0.1 # weight decay (no bias decay)
-    sample_interval: int = 20 # interval to sample from the model
+    sample_interval: int = 2500 # interval to sample from the model
 
 train_config = TrainingConfig()
 if not ddp or master_process:
@@ -101,7 +102,7 @@ def save_checkpoint(
     if checkpoint_dir is None:
         checkpoint_dir = Path.cwd() / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = checkpoint_dir / f"checkpoint_step_{step}.pt"
+    checkpoint_path = checkpoint_dir / f"model.pt"
 
     raw = model.module if hasattr(model, "module") else model
     state = {
@@ -128,7 +129,7 @@ def log_checkpoint_artifact(
 
     if wandb.run is not None:
         artifact = wandb.Artifact(
-            name=f"checkpoint-step-{step}",
+            name=f"model",
             type="model",
             metadata={"step": step},
         )
@@ -240,7 +241,7 @@ for step in range(1, train_config.max_steps + 1):
                 rng_states["cuda"] = torch.cuda.get_rng_state_all()
             log_checkpoint_artifact(model, optimizer, step, rng_states)
         if step % train_config.hellaswag_eval_interval == 0:
-            acc, acc_norm, acc_stderr, acc_norm_stderr = get_hellaswag_estimates(model, batch_size=train_config.B, device=device, limit=train_config.hellaswag_eval_limit)
+            acc, acc_norm, acc_stderr, acc_norm_stderr = get_hellaswag_estimates(raw_model, batch_size=train_config.B, device=device, limit=train_config.hellaswag_eval_limit)
             wandb.log({"validation/hellaswag/acc": acc,
                        "validation/hellaswag/acc_norm": acc_norm,
                        "validation/hellaswag/acc_stderr": acc_stderr,
@@ -248,12 +249,6 @@ for step in range(1, train_config.max_steps + 1):
 
 if not ddp or master_process:
     wandb.finish()
-
-# print samples to terminal
-if not ddp or master_process:
-    decoded = sample_from_model(model, "Hello, I'm a language model,", 5, 30)
-    for d in decoded:
-        print(d)
 
 if ddp:
     destroy_process_group()
