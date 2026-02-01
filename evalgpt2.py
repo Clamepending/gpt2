@@ -107,7 +107,7 @@ class MyGPT2LM(LM):
 
 from model import GPT2, GPT2config, load_model
 
-device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
 model = load_model()
 model = model.to(device)
 model.eval()
@@ -129,19 +129,27 @@ results = lm_eval.simple_evaluate(
     num_fewshot=5,
     batch_size=8,
     limit=100,
-    device="mps",
+    device=device,
 )
-# results = lm_eval.simple_evaluate(
-#     model="hf",
-#     model_args="pretrained=gpt2,dtype=float32",
-#     tasks=["hellaswag"],
-#     num_fewshot=5,
-#     batch_size=8,
-#     limit=100,
-#     device="mps",
-# )
 
-# with open("results.json", "w") as f:
-#     json.dump(results, f, default=handle_non_serializable, indent=2)
-# # print the results
-# print(results["results"]["hellaswag"])
+with open("hellaswag_mygpt2_results.json", "w") as f:
+    json.dump(results, f, default=handle_non_serializable, indent=2)
+# print the results
+print(f"MyGPT2 LM Hellaswag accuracy: {results['results']['hellaswag']['acc,none']} (+/- {results['results']['hellaswag']['acc_stderr,none']}) Normalized: {results['results']['hellaswag']['acc_norm,none']} (+/- {results['results']['hellaswag']['acc_norm_stderr,none']})")
+
+
+
+results = lm_eval.simple_evaluate(
+    model="hf",
+    model_args="pretrained=gpt2,dtype=float32",
+    tasks=["hellaswag"],
+    num_fewshot=5,
+    batch_size=8,
+    limit=100,
+    device=device,
+)
+
+with open("hellaswag_hf_results.json", "w") as f:
+    json.dump(results, f, default=handle_non_serializable, indent=2)
+# print the results
+print(f"HF GPT2 LM Hellaswag accuracy: {results['results']['hellaswag']['acc,none']} (+/- {results['results']['hellaswag']['acc_stderr,none']}) Normalized: {results['results']['hellaswag']['acc_norm,none']} (+/- {results['results']['hellaswag']['acc_norm_stderr,none']})")

@@ -1,4 +1,13 @@
 [project]
 name = "gpt2"
 version = "0.1.0"
-dependencies = ["tiktoken", "torch", "numpy", "wandb", "huggingface_hub"]
+dependencies = [
+    "tiktoken",
+    "torch",
+    "numpy",
+    "wandb",
+    "huggingface_hub",
+    "accelerate",
+    "transformers",
+    "lm-eval @ git+https://github.com/EleutherAI/lm-evaluation-harness.git",
+]
