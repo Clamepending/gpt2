@@ -156,7 +156,7 @@ if not ddp or master_process:
 
 torch.set_float32_matmul_precision("high")
 
-model = GPT2(GPT2config(vocab_size=50304, block_size=train_config.T)).to(device)
+model = GPT2(GPT2config(vocab_size=50257, block_size=train_config.T)).to(device)
 model = torch.compile(model)
 
 from torch.nn.parallel import DistributedDataParallel as DDP

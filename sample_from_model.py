@@ -4,24 +4,9 @@ import torch
 from torch.nn import functional as F
 import tiktoken
 import wandb
-from model import GPT2, GPT2config
+from model import GPT2, GPT2config, load_model
 
-def load_model():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    config = GPT2config(vocab_size=50304)
-    model = GPT2(config).to(device)
 
-    # Download from wandb (online) only; do not use local checkpoints/
-    artifact = wandb.Api().artifact("gpt2/checkpoint-step-18000:v0")
-    root = artifact.download(root=".")  # returns path to downloaded contents
-    state = torch.load(Path(root) / "checkpoint_step_18000.pt", map_location=device, weights_only=True)
-
-    prefix = "_orig_mod."
-    state = {k.removeprefix(prefix): v for k, v in state["model"].items() if k.startswith(prefix)}
-    model.load_state_dict(state, strict=True)
-
-    return model
 
 if torch.cuda.is_available():
     device = torch.device("cuda")

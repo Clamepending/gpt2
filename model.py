@@ -5,6 +5,8 @@ from torch.nn import functional as F
 import math
 import inspect
 from torch.distributed import init_process_group, destroy_process_group
+import wandb
+from pathlib import Path
 
 
 @dataclass
@@ -135,3 +137,23 @@ class GPT2(nn.Module):
             loss = F.cross_entropy(x.view(-1, x.size(-1)), targets.view(-1))
         return x, loss
         
+
+def load_model():
+    config = GPT2config(vocab_size=50257, block_size=1024)
+    model = GPT2(config)
+
+    # Download from wandb (online) only; do not use local checkpoints/
+    if not Path("checkpoint_step_18000_vocab50257.pt").exists():
+        artifact = wandb.Api().artifact("gpt2/checkpoint-step-18000:v0")
+        root = artifact.download(root=".")  # returns path to downloaded contents
+        state = torch.load(Path(root) / "checkpoint_step_18000.pt", map_location="cpu", weights_only=True)
+        prefix = "_orig_mod."
+        state = {k.removeprefix(prefix): v for k, v in state["model"].items() if k.startswith(prefix)}
+        model.load_state_dict(state, strict=True)
+    else:
+        raw = torch.load("checkpoint_step_18000_vocab50257.pt", map_location="cpu", weights_only=True)["model"]
+        prefix = "_orig_mod."
+        state = {k.removeprefix(prefix): v for k, v in raw.items() if k.startswith(prefix)}
+        model.load_state_dict(state, strict=True)
+
+    return model
