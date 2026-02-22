@@ -52,8 +52,10 @@ class FineWebDataLoader:
             raise ValueError(f"No shards assigned to rank {ddp_rank} for split {split}")
         
         self.current_shard_idx = 0
+        self.current_shard_local_idx = -1
         self.current_shard_data = None
         self.current_shard_pos = 0
+        self.shard_order = np.random.permutation(len(self.shard_files)) # shuffle shard order to fix U shaped loss?
         
         # The main tensor buffer
         self.token_buffer = torch.zeros(buffer_size + B * T + 1, dtype=torch.long)
@@ -70,14 +72,15 @@ class FineWebDataLoader:
         # Only load if we don't have a shard or current shard is exhausted
         if self.current_shard_data is None or self.current_shard_pos >= len(self.current_shard_data):
             # Load next shard
-            shard_file = self.shard_files[self.current_shard_idx]
+            self.current_shard_local_idx = int(self.shard_order[self.current_shard_idx])
+            shard_file = self.shard_files[self.current_shard_local_idx]
             self.current_shard_data = np.load(shard_file)
             # Convert to torch tensor and ensure it's long dtype
             self.current_shard_data = torch.from_numpy(self.current_shard_data).long()
             self.current_shard_pos = 0
             
             # Move to next shard (with wrap-around)
-            self.current_shard_idx = (self.current_shard_idx + 1) % len(self.shard_files)
+            self.current_shard_idx = (self.current_shard_idx + 1) % len(self.shard_order)
         
     def _fill_buffer(self):
         # 1. Shift unused tokens to the start
@@ -93,14 +96,13 @@ class FineWebDataLoader:
             if len(self.remainder) > 0:
                 t_tokens = self.remainder
                 self.remainder = torch.tensor([], dtype=torch.long) # Clear it
-                from_shard = False
             else:
                 # 3. Otherwise, load tokens from the current shard
                 self._load_next_shard()
                 
                 # Get tokens from current position in shard
                 t_tokens = self.current_shard_data[self.current_shard_pos:]
-                from_shard = True
+
 
             # 4. Determine how much fits
             space_left = self.token_buffer.size(0) - self.buffer_fill
@@ -109,16 +111,14 @@ class FineWebDataLoader:
                 self.token_buffer[self.buffer_fill : self.buffer_fill + len(t_tokens)] = t_tokens
                 self.buffer_fill += len(t_tokens)
                 # Update shard position if we consumed from shard
-                if from_shard:
-                    self.current_shard_pos += len(t_tokens)
+                self.current_shard_pos += len(t_tokens)
             else:
                 # It doesn't all fit. Take what we can and save the rest in remainder.
                 self.token_buffer[self.buffer_fill : self.buffer_fill + space_left] = t_tokens[:space_left]
                 self.remainder = t_tokens[space_left:] # Save for next loop/call
                 self.buffer_fill += space_left
                 # Update shard position if we consumed from shard
-                if from_shard:
-                    self.current_shard_pos += space_left
+                self.current_shard_pos += space_left
 
     def get_batch(self):
         req = self.B * self.T
@@ -131,6 +131,12 @@ class FineWebDataLoader:
         
         self.current_pos += req
         return x, y
+    
+    # fraction of the current shard that has been processed
+    def get_current_shard_progress(self):
+        if self.current_shard_data is None or len(self.current_shard_data) == 0:
+            return 0.0
+        return float(self.current_shard_pos) / len(self.current_shard_data)
 
 
 import time

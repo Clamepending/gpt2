@@ -41,7 +41,7 @@ if torch.cuda.is_available():
 @dataclass
 class TrainingConfig:
     total_batch_size: int = 524288 * 3//4 # to get 6 4090s to train
-    B: int = 8 # 4
+    B: int = 16 # 4
     T: int = 1024 # 2048
     grad_accumulation_steps: int = total_batch_size // (B * T * ddp_world_size)
     max_steps: int = 80_000 # total number of training steps 40k is around 13 hours on 4 4090s
@@ -214,8 +214,10 @@ for step in range(1, train_config.max_steps + 1):
                    "train/lr": lr,
                    "train/norm": norm,
                    "train/tokens_per_second": train_config.B*train_config.T*train_config.grad_accumulation_steps*ddp_world_size/(end_time - start_time),
-                #    "train/perplexity": perplexity[step],
-                   "train/tokens_processed": tokens_processed},
+                   "train/tokens_processed": tokens_processed,
+                   "train/current_shard_idx": train_dataloader.current_shard_local_idx,
+                   "train/num_shards": len(train_dataloader.shard_files),
+                   "train/current_shard_progress": train_dataloader.get_current_shard_progress()},
                     step=step)
         if step % train_config.sample_interval == 0:
             with torch.inference_mode():

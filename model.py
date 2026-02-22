@@ -26,7 +26,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.c_proj.RESIDUAL_SCALE_FLAG = True
         
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)) # for batch, num_heads, bloxksize, blocksize
+        # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)) # for batch, num_heads, bloxksize, blocksize
         
     def forward(self, x):
         B, T, C = x.size()
