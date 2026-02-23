@@ -44,14 +44,14 @@ class TrainingConfig:
     B: int = 16 # 4
     T: int = 1024 # 2048
     grad_accumulation_steps: int = total_batch_size // (B * T * ddp_world_size)
-    max_steps: int = 80_000 # total number of training steps 40k is around 13 hours on 4 4090s
+    max_steps: int = 30_000 # total number of training steps 40k is around 13 hours on 4 4090s
     
     num_samples_per_interval: int = 5 # number of samples to generate per interval
     sample_max_length: int = 50 # maximum length of the generated samples including prompt
     save_interval: int = 5_000 # interval to save the model checkpoint
-    hellaswag_eval_interval: int = 1000 # interval to evaluate the hellaswag accuracy
+    hellaswag_eval_interval: int = 500 # interval to evaluate the hellaswag accuracy
     max_lr: float = 1e-3 # maximum learning rate for cosine schedule (original 6e-4)
-    hellaswag_eval_limit: int = 500 # limit for the hellaswag evaluation
+    # hellaswag_eval_limit: int = 5000 # limit for the hellaswag evaluation, default is 10043
     min_lr: float = max_lr * 0.1 # minimum learning rate for cosine schedule
     warmup_steps: int = 300 # number of warmup steps
     weight_decay: float = 0.1 # weight decay (no bias decay)
@@ -242,7 +242,7 @@ for step in range(1, train_config.max_steps + 1):
             if torch.cuda.is_available():
                 rng_states["cuda"] = torch.cuda.get_rng_state_all()
             log_checkpoint_artifact(model, optimizer, step, rng_states)
-    if step % train_config.hellaswag_eval_interval == 0:
+    if step % train_config.hellaswag_eval_interval == 0 or step == 1:
         acc, acc_norm, acc_stderr, acc_norm_stderr = get_hellaswag_estimates(
             raw_model,
             batch_size=train_config.B,

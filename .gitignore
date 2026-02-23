@@ -8,4 +8,5 @@ checkpoints/
 *.pt
 *.pkl
 
+eval/hellaswag/
 fineweb_sample_10B/
