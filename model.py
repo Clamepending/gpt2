@@ -57,7 +57,18 @@ class MLP(nn.Module):
         x = self.gelu(x)
         x = self.c_proj(x)
         return x
-
+    
+class SwiGLU(nn.Module):
+    def __init__(self, config: GPT2config):
+        super().__init__()
+        # roudn to nearest 256
+        self.d_hidden = round(config.n_embed * 8 / (3 * 256)) * 256
+        self.proj_gate = nn.Linear(config.n_embed, self.d_hidden * 2)
+        self.out_proj = nn.Linear(self.d_hidden, config.n_embed)
+    def forward(self, x):
+        gate, latent = self.proj_gate(x).chunk(2, dim = -1)
+        return self.out_proj(gate * F.silu(latent))
+        
 
 class Block(nn.Module):
     def __init__(self, config: GPT2config):

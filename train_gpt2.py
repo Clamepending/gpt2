@@ -49,11 +49,11 @@ class TrainingConfig:
     num_samples_per_interval: int = 5 # number of samples to generate per interval
     sample_max_length: int = 50 # maximum length of the generated samples including prompt
     save_interval: int = 5_000 # interval to save the model checkpoint
-    hellaswag_eval_interval: int = 2500 # interval to evaluate the hellaswag accuracy
-    max_lr: float = 2e-3 # maximum learning rate for cosine schedule (original 6e-4)
-    hellaswag_eval_limit: int = 30 # limit for the hellaswag evaluation
+    hellaswag_eval_interval: int = 1000 # interval to evaluate the hellaswag accuracy
+    max_lr: float = 1e-3 # maximum learning rate for cosine schedule (original 6e-4)
+    hellaswag_eval_limit: int = 500 # limit for the hellaswag evaluation
     min_lr: float = max_lr * 0.1 # minimum learning rate for cosine schedule
-    warmup_steps: int = 10 # number of warmup steps
+    warmup_steps: int = 300 # number of warmup steps
     weight_decay: float = 0.1 # weight decay (no bias decay)
     sample_interval: int = 2500 # interval to sample from the model
 
@@ -242,8 +242,16 @@ for step in range(1, train_config.max_steps + 1):
             if torch.cuda.is_available():
                 rng_states["cuda"] = torch.cuda.get_rng_state_all()
             log_checkpoint_artifact(model, optimizer, step, rng_states)
-        if step % train_config.hellaswag_eval_interval == 0:
-            acc, acc_norm, acc_stderr, acc_norm_stderr = get_hellaswag_estimates(raw_model, batch_size=train_config.B, device=device, limit=train_config.hellaswag_eval_limit)
+    if step % train_config.hellaswag_eval_interval == 0:
+        acc, acc_norm, acc_stderr, acc_norm_stderr = get_hellaswag_estimates(
+            raw_model,
+            batch_size=train_config.B,
+            device=device,
+            limit=train_config.hellaswag_eval_limit,
+            ddp_rank=ddp_rank,
+            ddp_world_size=ddp_world_size,
+        )
+        if not ddp or master_process:
             wandb.log({"validation/hellaswag/acc": acc,
                        "validation/hellaswag/acc_norm": acc_norm,
                        "validation/hellaswag/acc_stderr": acc_stderr,
