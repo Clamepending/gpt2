@@ -1,76 +1,49 @@
-from dataclasses import dataclass
 import torch
-import torch.nn as nn
 import torch.nn as nn
 from torch.nn import functional as F
 import math
-import inspect
-from fineweb_dataloader import FineWebDataLoader
-import wandb
+import os
+import time
 from pathlib import Path
+
+import hydra
+from omegaconf import DictConfig, OmegaConf
+import tiktoken
+import wandb
+
+from fineweb_dataloader import FineWebDataLoader
 from model import GPT2, GPT2config
 from evalgpt2 import get_hellaswag_estimates
 
 # DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-import os
-ddp = int(os.environ.get("RANK", -1)) != -1
-if ddp:
-    ddp_rank = int(os.environ["RANK"])
-    ddp_local_rank = int(os.environ["LOCAL_RANK"])
-    ddp_world_size = int(os.environ["WORLD_SIZE"])
-    
-    master_process = ddp_rank == 0
-    
-    torch.cuda.set_device(f'cuda:{ddp_local_rank}')
-    device = torch.device(f'cuda:{ddp_local_rank}')
-    init_process_group(backend="nccl")
-else:
-    ddp_rank = 0
-    ddp_local_rank =0 
-    ddp_world_size = 1
-    master_process = True
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-torch.manual_seed(42)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(42)
-    
-    
-@dataclass
-class TrainingConfig:
-    total_batch_size: int = 524288 * 3//4 # to get 6 4090s to train
-    B: int = 16 # 4
-    T: int = 1024 # 2048
-    grad_accumulation_steps: int = total_batch_size // (B * T * ddp_world_size)
-    max_steps: int = 30_000 # total number of training steps 40k is around 13 hours on 4 4090s
-    
-    num_samples_per_interval: int = 5 # number of samples to generate per interval
-    sample_max_length: int = 50 # maximum length of the generated samples including prompt
-    save_interval: int = 5_000 # interval to save the model checkpoint
-    hellaswag_eval_interval: int = 500 # interval to evaluate the hellaswag accuracy
-    max_lr: float = 1e-3 # maximum learning rate for cosine schedule (original 6e-4)
-    # hellaswag_eval_limit: int = 5000 # limit for the hellaswag evaluation, default is 10043
-    min_lr: float = max_lr * 0.1 # minimum learning rate for cosine schedule
-    warmup_steps: int = 300 # number of warmup steps
-    weight_decay: float = 0.1 # weight decay (no bias decay)
-    sample_interval: int = 2500 # interval to sample from the model
+def setup_distributed():
+    ddp = int(os.environ.get("RANK", -1)) != -1
+    if ddp:
+        ddp_rank = int(os.environ["RANK"])
+        ddp_local_rank = int(os.environ["LOCAL_RANK"])
+        ddp_world_size = int(os.environ["WORLD_SIZE"])
+        master_process = ddp_rank == 0
 
-train_config = TrainingConfig()
-if not ddp or master_process:
-    wandb.init(project="gpt2", config=train_config)
-    assert train_config.total_batch_size % (train_config.B * train_config.T * ddp_world_size) == 0
-    print(f"Total batch size: {train_config.total_batch_size}, Grad accumulation steps: {train_config.grad_accumulation_steps}")
+        torch.cuda.set_device(f"cuda:{ddp_local_rank}")
+        device = torch.device(f"cuda:{ddp_local_rank}")
+        init_process_group(backend="nccl")
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        master_process = True
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    
-    
+    return ddp, ddp_rank, ddp_local_rank, ddp_world_size, master_process, device
 
-# --------------------------------------------------
 
-def sample_from_model(model, prompt, num_return_sequences, max_length) -> list[str]:
+def sample_from_model(model, prompt, num_return_sequences, max_length, tokenizer, device) -> list[str]:
     tokens = tokenizer.encode(prompt)
-    tokens = torch.tensor(tokens, dtype = torch.long)
+    tokens = torch.tensor(tokens, dtype=torch.long)
     tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
     x = tokens.to(device)
 
@@ -117,148 +90,211 @@ def save_checkpoint(
     return checkpoint_path
 
 
-def log_checkpoint_artifact(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    step: int,
-    rng_states: dict | None = None,
-) -> None:
-    # Save full checkpoint to project-level checkpoints/
-    checkpoint_dir = Path.cwd() / "checkpoints"
+def log_checkpoint_artifact(model: nn.Module, optimizer: torch.optim.Optimizer, step: int, checkpoint_dir: Path, rng_states: dict | None = None) -> None:
     checkpoint_path = save_checkpoint(model, optimizer, step, checkpoint_dir, rng_states)
 
     if wandb.run is not None:
-        artifact = wandb.Artifact(
-            name=f"model",
-            type="model",
-            metadata={"step": step},
-        )
+        artifact = wandb.Artifact(name="model", type="model", metadata={"step": step})
         artifact.add_file(checkpoint_path.as_posix(), name=checkpoint_path.name)
         wandb.log_artifact(artifact)
 
-def get_lr(it):
-    if it < train_config.warmup_steps:
-        return train_config.max_lr * (it + 1)/train_config.warmup_steps
-    if it > train_config.max_steps:
-        return train_config.min_lr
-    
-    decay_ratio = (it - train_config.warmup_steps) / (train_config.max_steps - train_config.warmup_steps)
+
+def get_lr(it, cfg_train):
+    if it < cfg_train.warmup_steps:
+        return cfg_train.max_lr * (it + 1) / cfg_train.warmup_steps
+    if it > cfg_train.max_steps:
+        return cfg_train.min_lr
+
+    decay_ratio = (it - cfg_train.warmup_steps) / (cfg_train.max_steps - cfg_train.warmup_steps)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return train_config.min_lr + coeff * (train_config.max_lr - train_config.min_lr)
-
-import tiktoken
-tokenizer = tiktoken.get_encoding("gpt2")
+    return cfg_train.min_lr + coeff * (cfg_train.max_lr - cfg_train.min_lr)
 
 
-# shakespeare_dataset = DataloaderLite(4, 1024, ddp_rank, ddp_world_size)
-train_dataloader = FineWebDataLoader(B=train_config.B, T=train_config.T, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size, split="training")
-if not ddp or master_process:
-    validation_dataloader = FineWebDataLoader(B=train_config.B, T=train_config.T, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size, split="validation")
+@hydra.main(version_base=None, config_path="conf", config_name="config")
+def main(cfg: DictConfig):
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size, master_process, device = setup_distributed()
 
+    try:
+        tokenizer = tiktoken.get_encoding("gpt2")
 
-torch.set_float32_matmul_precision("high")
+        torch.manual_seed(int(cfg.runtime.seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(int(cfg.runtime.seed))
 
-model = GPT2(GPT2config(vocab_size=50257, block_size=train_config.T)).to(device)
-model = torch.compile(model)
+        grad_accumulation_steps = cfg.train.total_batch_size // (cfg.train.B * cfg.train.T * ddp_world_size)
+        assert cfg.train.total_batch_size % (cfg.train.B * cfg.train.T * ddp_world_size) == 0
 
-from torch.nn.parallel import DistributedDataParallel as DDP
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module if ddp else model
+        if master_process and cfg.runtime.use_wandb:
+            wandb.init(
+                project=cfg.runtime.wandb_project,
+                config=OmegaConf.to_container(cfg, resolve=True),
+                name=cfg.experiment_name,
+            )
+            print(f"Total batch size: {cfg.train.total_batch_size}, Grad accumulation steps: {grad_accumulation_steps}")
 
-
-
-import time
-# perplexity = torch.zeros(train_config.max_steps, device = device)
-tokens_processed = 0
-
-optimizer = raw_model.configure_optimizers(weight_decay = train_config.weight_decay, learning_rate = train_config.max_lr, device = device)
-
-for step in range(1, train_config.max_steps + 1):
-    start_time = time.time()
-    optimizer.zero_grad()
-    loss_accumulated = 0
-    for micro_step in range(train_config.grad_accumulation_steps):
-        x, y = train_dataloader.get_batch()
-        x = x.to(device)
-        y = y.to(device)
-        if ddp and micro_step != train_config.grad_accumulation_steps - 1: # don't sync gradients until the last micro_step
-            with model.no_sync():
-                with torch.autocast(device_type = device.type, dtype = torch.bfloat16):
-                    logits, loss = model(x, y)
-                loss = loss / train_config.grad_accumulation_steps
-                loss.backward()
-        else:
-            with torch.autocast(device_type = device.type, dtype = torch.bfloat16):
-                logits, loss = model(x, y)
-            loss = loss / train_config.grad_accumulation_steps
-            loss.backward()
-        loss_accumulated += loss.detach()
-    
-    if ddp:
-        torch.distributed.all_reduce(loss_accumulated, op = torch.distributed.ReduceOp.AVG) # average the loss across all devices
-    loss = loss_accumulated.item()
-    # perplexity[step] = torch.exp(losses[step])
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    lr = get_lr(step)
-    for param in optimizer.param_groups:
-        param["lr"] = lr
-    optimizer.step()
-    torch.cuda.synchronize()
-    end_time = time.time()
-    if not ddp or master_process:
-        tokens_processed += train_config.B*train_config.T*train_config.grad_accumulation_steps*ddp_world_size
-        print(f"Step {step}: loss {loss_accumulated.item():.6f}, lr {lr:.6f}, time {end_time - start_time}, norm {norm: .4f}, tokens per second {train_config.B*train_config.T*train_config.grad_accumulation_steps*ddp_world_size/(end_time - start_time):.2f}")
-        wandb.log({"train/loss": loss,
-                   "train/lr": lr,
-                   "train/norm": norm,
-                   "train/tokens_per_second": train_config.B*train_config.T*train_config.grad_accumulation_steps*ddp_world_size/(end_time - start_time),
-                   "train/tokens_processed": tokens_processed,
-                   "train/current_shard_idx": train_dataloader.current_shard_local_idx,
-                   "train/num_shards": len(train_dataloader.shard_files),
-                   "train/current_shard_progress": train_dataloader.get_current_shard_progress()},
-                    step=step)
-        if step % train_config.sample_interval == 0:
-            with torch.inference_mode():
-                x, y = validation_dataloader.get_batch()
-                x = x.to(device)
-                y = y.to(device)
-                with torch.autocast(device_type = device.type, dtype = torch.bfloat16):
-                    logits, loss = raw_model(x, y) # deadlocks if use ddp model here because only master process validates
-                wandb.log({"validation/loss": loss.item()}, step=step)
-                        # "validation/perplexity": torch.exp(loss)}, step=step)
-            
-                responses = sample_from_model(model, "Hello, I'm a language model,", train_config.num_samples_per_interval, train_config.sample_max_length)
-                table_data = [(step, response) for response in responses]
-                table = wandb.Table(data=table_data, columns=["step", "sample"])
-                wandb.log({"samples": table}, step=step)
-                
-        # save checkpoint (only on master when using DDP)
-        if step % train_config.save_interval == 0:
-            rng_states = {
-                "cpu": torch.get_rng_state(),
-            }
-            if torch.cuda.is_available():
-                rng_states["cuda"] = torch.cuda.get_rng_state_all()
-            log_checkpoint_artifact(model, optimizer, step, rng_states)
-    if step % train_config.hellaswag_eval_interval == 0 or step == 1:
-        acc, acc_norm, acc_stderr, acc_norm_stderr = get_hellaswag_estimates(
-            raw_model,
-            batch_size=train_config.B,
-            device=device,
-            limit=train_config.hellaswag_eval_limit,
+        train_dataloader = FineWebDataLoader(
+            B=cfg.train.B,
+            T=cfg.train.T,
             ddp_rank=ddp_rank,
             ddp_world_size=ddp_world_size,
+            split="training",
+            dataset_path=cfg.data.dataset_path,
+            buffer_size=cfg.data.buffer_size,
         )
-        if not ddp or master_process:
-            wandb.log({"validation/hellaswag/acc": acc,
-                       "validation/hellaswag/acc_norm": acc_norm,
-                       "validation/hellaswag/acc_stderr": acc_stderr,
-                       "validation/hellaswag/acc_norm_stderr": acc_norm_stderr}, step=step)
+        if master_process:
+            validation_dataloader = FineWebDataLoader(
+                B=cfg.train.B,
+                T=cfg.train.T,
+                ddp_rank=ddp_rank,
+                ddp_world_size=ddp_world_size,
+                split="validation",
+                dataset_path=cfg.data.dataset_path,
+                buffer_size=cfg.data.buffer_size,
+            )
 
-if not ddp or master_process:
-    wandb.finish()
+        torch.set_float32_matmul_precision("high")
 
-if ddp:
-    destroy_process_group()
+        model_cfg = GPT2config(
+            vocab_size=cfg.model.vocab_size,
+            n_layer=cfg.model.n_layer,
+            n_head=cfg.model.n_head,
+            n_embed=cfg.model.n_embed,
+            block_size=cfg.train.T,
+            ffn_type=cfg.model.ffn_type,
+        )
+        model = GPT2(model_cfg).to(device)
+        if cfg.runtime.compile:
+            model = torch.compile(model)
+
+        if ddp:
+            model = DDP(model, device_ids=[ddp_local_rank])
+        raw_model = model.module if ddp else model
+
+        tokens_processed = 0
+        checkpoint_dir = Path(cfg.runtime.checkpoint_dir)
+        optimizer = raw_model.configure_optimizers(
+            weight_decay=cfg.train.weight_decay,
+            learning_rate=cfg.train.max_lr,
+            device=device,
+        )
+
+        for step in range(1, cfg.train.max_steps + 1):
+            start_time = time.time()
+            optimizer.zero_grad()
+            loss_accumulated = 0
+            for micro_step in range(grad_accumulation_steps):
+                x, y = train_dataloader.get_batch()
+                x = x.to(device)
+                y = y.to(device)
+                if ddp and micro_step != grad_accumulation_steps - 1:
+                    with model.no_sync():
+                        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                            _, loss = model(x, y)
+                        loss = loss / grad_accumulation_steps
+                        loss.backward()
+                else:
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                        _, loss = model(x, y)
+                    loss = loss / grad_accumulation_steps
+                    loss.backward()
+                loss_accumulated += loss.detach()
+
+            if ddp:
+                torch.distributed.all_reduce(loss_accumulated, op=torch.distributed.ReduceOp.AVG)
+            loss = loss_accumulated.item()
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            lr = get_lr(step, cfg.train)
+            for param in optimizer.param_groups:
+                param["lr"] = lr
+            optimizer.step()
+
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+
+            end_time = time.time()
+            if master_process:
+                tokens_processed += cfg.train.B * cfg.train.T * grad_accumulation_steps * ddp_world_size
+                tokens_per_second = cfg.train.B * cfg.train.T * grad_accumulation_steps * ddp_world_size / (end_time - start_time)
+                print(
+                    f"Step {step}: loss {loss:.6f}, lr {lr:.6f}, time {end_time - start_time}, "
+                    f"norm {norm: .4f}, tokens per second {tokens_per_second:.2f}"
+                )
+                if cfg.runtime.use_wandb:
+                    wandb.log(
+                        {
+                            "train/loss": loss,
+                            "train/lr": lr,
+                            "train/norm": norm,
+                            "train/tokens_per_second": tokens_per_second,
+                            "train/tokens_processed": tokens_processed,
+                            "train/current_shard_idx": train_dataloader.current_shard_local_idx,
+                            "train/num_shards": len(train_dataloader.shard_files),
+                            "train/current_shard_progress": train_dataloader.get_current_shard_progress(),
+                        },
+                        step=step,
+                    )
+
+                if step % cfg.train.sample_interval == 0:
+                    with torch.inference_mode():
+                        x, y = validation_dataloader.get_batch()
+                        x = x.to(device)
+                        y = y.to(device)
+                        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                            _, val_loss = raw_model(x, y)
+                        if cfg.runtime.use_wandb:
+                            wandb.log({"validation/loss": val_loss.item()}, step=step)
+
+                        responses = sample_from_model(
+                            raw_model,
+                            cfg.train.sample_prompt,
+                            cfg.train.num_samples_per_interval,
+                            cfg.train.sample_max_length,
+                            tokenizer,
+                            device,
+                        )
+                        if cfg.runtime.use_wandb:
+                            table_data = [(step, response) for response in responses]
+                            table = wandb.Table(data=table_data, columns=["step", "sample"])
+                            wandb.log({"samples": table}, step=step)
+
+                if step % cfg.train.save_interval == 0:
+                    rng_states = {
+                        "cpu": torch.get_rng_state(),
+                    }
+                    if torch.cuda.is_available():
+                        rng_states["cuda"] = torch.cuda.get_rng_state_all()
+                    if cfg.runtime.use_wandb:
+                        log_checkpoint_artifact(model, optimizer, step, checkpoint_dir, rng_states)
+                    else:
+                        save_checkpoint(model, optimizer, step, checkpoint_dir, rng_states)
+
+            if step % cfg.train.hellaswag_eval_interval == 0 or step == 1:
+                acc, acc_norm, acc_stderr, acc_norm_stderr = get_hellaswag_estimates(
+                    raw_model,
+                    batch_size=cfg.train.B,
+                    device=device,
+                    limit=cfg.train.hellaswag_eval_limit,
+                    ddp_rank=ddp_rank,
+                    ddp_world_size=ddp_world_size,
+                )
+                if master_process and cfg.runtime.use_wandb:
+                    wandb.log(
+                        {
+                            "validation/hellaswag/acc": acc,
+                            "validation/hellaswag/acc_norm": acc_norm,
+                            "validation/hellaswag/acc_stderr": acc_stderr,
+                            "validation/hellaswag/acc_norm_stderr": acc_norm_stderr,
+                        },
+                        step=step,
+                    )
+
+        if master_process and cfg.runtime.use_wandb:
+            wandb.finish()
+    finally:
+        if ddp:
+            destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

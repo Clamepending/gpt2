@@ -1,0 +1,5 @@
+seed: 42
+compile: true
+use_wandb: true
+wandb_project: gpt2
+checkpoint_dir: checkpoints

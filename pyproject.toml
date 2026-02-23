@@ -2,6 +2,7 @@
 name = "gpt2"
 version = "0.1.0"
 dependencies = [
+    "hydra-core",
     "tiktoken",
     "torch",
     "numpy",

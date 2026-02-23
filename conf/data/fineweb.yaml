@@ -1,0 +1,2 @@
+dataset_path: fineweb_sample_10B
+buffer_size: 1000000

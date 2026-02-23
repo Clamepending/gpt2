@@ -1,0 +1,12 @@
+defaults:
+  - train: base
+  - model: gpt2_small
+  - data: fineweb
+  - runtime: default
+  - _self_
+
+experiment_name: null
+
+hydra:
+  job:
+    chdir: false

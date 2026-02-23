@@ -1,0 +1,32 @@
+train:
+  total_batch_size: 393216
+  B: 16
+  T: 1024
+  max_steps: 20000
+  num_samples_per_interval: 5
+  sample_max_length: 50
+  sample_prompt: Hello, I'm a language model,
+  sample_interval: 2500
+  save_interval: 5000
+  hellaswag_eval_interval: 500
+  hellaswag_eval_limit: null
+  max_lr: 0.001
+  min_lr: 0.0001
+  warmup_steps: 300
+  weight_decay: 0.1
+model:
+  vocab_size: 50257
+  n_layer: 12
+  n_head: 12
+  n_embed: 768
+  ffn_type: swiglu
+data:
+  dataset_path: fineweb_sample_10B
+  buffer_size: 1000000
+runtime:
+  seed: 42
+  compile: true
+  use_wandb: true
+  wandb_project: gpt2
+  checkpoint_dir: checkpoints
+experiment_name: null
